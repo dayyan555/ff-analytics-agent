@@ -7,11 +7,12 @@ is deterministic code.
 
 from __future__ import annotations
 
-from typing import Literal
+import json
+import re
+from typing import Any, Literal
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.output_parsers import PydanticOutputParser
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 Intent = Literal["query", "compare", "clarify", "unsupported"]
 
@@ -23,7 +24,7 @@ class Filter(BaseModel, extra="forbid"):
 
 class Plan(BaseModel, extra="forbid"):
     intent: Intent
-    measures: list[str] = Field(default=[], max_length=10)  # plain str: an unknown name is a catalog rejection
+    measures: list[str] = Field(default=[], max_length=12)  # plain str: an unknown name is a catalog rejection
     dimension: str | None = None
     period: str | None = None  # grammar string, see app/agent/dates.py
     compare_period: str | None = None  # grammar string or "previous_period"
@@ -34,6 +35,11 @@ class Plan(BaseModel, extra="forbid"):
     granularity: Literal["day", "week", "month"] | None = None  # set -> unsupported
     message: str | None = None  # never rendered; visible in the UI "Plan" tab and the trace
 
+    @field_validator("measures", "filters", mode="before")
+    @classmethod
+    def _null_is_empty(cls, value: Any) -> Any:  # weak models write null where the schema says []
+        return [] if value is None else value
+
     @model_validator(mode="after")
     def _consistent(self) -> "Plan":
         if self.intent in ("query", "compare") and not self.measures:
@@ -43,18 +49,52 @@ class Plan(BaseModel, extra="forbid"):
         return self
 
 
-PARSER = PydanticOutputParser(pydantic_object=Plan)
+def strict_schema() -> dict:
+    """The Plan as an OpenAI-style strict JSON schema: every key required (nullable where
+    optional) and no extra keys. Sent as ``response_format`` so models that honour it return
+    plain JSON; the free router does not reliably filter on it, so the parser and the
+    repair/re-roll loop in ``interpret`` remain the real safeguard."""
+    schema = Plan.model_json_schema()
+
+    def tighten(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object" and "properties" in node:
+                node["required"] = list(node["properties"])
+                node["additionalProperties"] = False
+            for value in node.values():
+                tighten(value)
+        elif isinstance(node, list):
+            for value in node:
+                tighten(value)
+
+    tighten(schema)
+    return schema
+
+
+PLAN_RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {"name": "plan", "strict": True, "schema": strict_schema()}}
+
+
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+_DECODER = json.JSONDecoder()
 
 
 def parse_plan(text: str) -> Plan:
     """Parse the model's reply into a Plan.
 
-    Tolerates code fences, prose or ``<think>`` prefixes around the JSON
-    object; raises ``OutputParserException`` (the only exception type
-    ``PydanticOutputParser`` emits) on anything that is not a valid Plan.
+    Tolerates ``<think>`` blocks, code fences, prose before or after the JSON
+    and stray trailing braces: the first complete JSON object in the text is
+    decoded and validated. Raises ``OutputParserException`` otherwise.
     """
-    start, end = text.find("{"), text.rfind("}")
-    candidate = text[start : end + 1] if start != -1 and end > start else text
-    if not candidate.strip():
-        raise OutputParserException("empty reply", llm_output=text)
-    return PARSER.parse(candidate)
+    cleaned = _THINK.sub("", text or "")
+    start = cleaned.find("{")
+    if start == -1:
+        raise OutputParserException("no JSON object in the reply", llm_output=text)
+    try:
+        data, _ = _DECODER.raw_decode(cleaned, start)
+    except json.JSONDecodeError as exc:
+        raise OutputParserException(f"invalid JSON: {exc.msg} at position {exc.pos}", llm_output=text) from exc
+    try:
+        return Plan.model_validate(data)
+    except ValidationError as exc:
+        problems = "; ".join(f"{'.'.join(str(p) for p in e['loc']) or 'plan'}: {e['msg']}" for e in exc.errors()[:4])
+        raise OutputParserException(f"plan does not match the schema: {problems}", llm_output=text) from exc

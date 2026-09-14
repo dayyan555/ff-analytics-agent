@@ -28,8 +28,6 @@ class Settings:
     cube_url: str
     cube_api_secret: str
     as_of: date
-    host: str
-    port: int
 
     @property
     def langfuse_enabled(self) -> bool:
@@ -46,8 +44,6 @@ def load_settings() -> Settings:
         cube_url=os.environ.get("CUBE_URL", "http://localhost:4000").rstrip("/"),
         cube_api_secret=os.environ.get("CUBEJS_API_SECRET", ""),
         as_of=date.fromisoformat(os.environ.get("AGENT_AS_OF_DATE", "2026-09-14")),
-        host=os.environ.get("HOST", "127.0.0.1"),
-        port=int(os.environ.get("PORT", "8000")),
     )
 
 

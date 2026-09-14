@@ -111,7 +111,7 @@ def test_load_catalog_keeps_member_metadata_from_meta():
     cat = load_catalog(FakeCube())
     cpm = cat.measures["cpm"]
     assert (cpm.format, cpm.currency, cpm.agg_type) == ("currency_2", "USD", "number")
-    assert cpm.description == "spend per 1,000 impressions; null when impressions = 0"
+    assert cpm.description == "spend per 1,000 impressions; null when impressions = 0."
     assert cat.dimensions["country"].description == "Country the campaign runs in: US, UK or DE"
     assert cat.summary()["values"] == cat.values and cat.summary()["coverage"] == {"first": "2026-03-01", "last": "2026-08-31"}
 

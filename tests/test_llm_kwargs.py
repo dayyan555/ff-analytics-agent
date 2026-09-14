@@ -34,10 +34,13 @@ def plan_llm() -> OpenRouterPlanLLM:
 def test_bound_chat_model_kwargs(plan_llm):
     llm = plan_llm._llm
     assert llm.model_name == "openrouter/free"
-    assert llm.request_timeout == 60000  # milliseconds
+    assert llm.request_timeout == 90000  # milliseconds
     assert llm.max_retries == 0
     assert llm.model_kwargs["retries"] is None  # also disables the SDK's own retry config
-    assert llm.model_kwargs["response_format"] == {"type": "json_object"}
+    rf = llm.model_kwargs["response_format"]
+    assert rf["type"] == "json_schema" and rf["json_schema"]["strict"] is True
+    schema = rf["json_schema"]["schema"]
+    assert set(schema["required"]) == set(schema["properties"]) and schema["additionalProperties"] is False
 
 
 def test_plan_returns_the_routed_model_and_cost(plan_llm):
@@ -53,7 +56,7 @@ def test_plan_returns_the_routed_model_and_cost(plan_llm):
     assert reply.model_name.endswith(":free") and reply.cost == 0
     assert plan_llm.calls == 1 and len(sent) == 1
     assert sent[0]["retries"] is None and sent[0]["model"] == "openrouter/free"
-    assert sent[0]["response_format"] == {"type": "json_object"}
+    assert sent[0]["response_format"]["type"] == "json_schema"
     assert sent[0]["messages"][0]["content"] == "q"
 
 
@@ -117,3 +120,23 @@ def test_http_200_error_body_is_unavailable_not_a_repair_turn(plan_llm):
     with pytest.raises(LLMError) as info:
         plan_llm.plan([HumanMessage("q")])
     assert info.value.kind == "unavailable" and info.value.status == 502
+
+
+def test_router_rejecting_the_schema_relaxes_to_json_mode_once(plan_llm):
+    from openrouter.errors import BadRequestResponseError, BadRequestResponseErrorData
+    sent = []
+
+    def fake_send(**kwargs):
+        sent.append(kwargs["response_format"])
+        if kwargs["response_format"]["type"] == "json_schema":
+            response = httpx.Response(400, request=httpx.Request("POST", "https://x"))
+            data = BadRequestResponseErrorData.model_validate({"error": {"code": 400, "message": "No endpoints found that support structured outputs"}})
+            raise BadRequestResponseError(data, response, "{}")
+        return completion(cost=0)
+
+    plan_llm._llm.client.chat.send = fake_send
+    reply = plan_llm.plan([HumanMessage("q")])
+    assert reply.model_name.endswith(":free") and plan_llm.calls == 2
+    assert [rf["type"] for rf in sent] == ["json_schema", "json_object"]
+    plan_llm.plan([HumanMessage("q")])  # stays relaxed: no second schema attempt
+    assert sent[-1]["type"] == "json_object" and plan_llm.calls == 3

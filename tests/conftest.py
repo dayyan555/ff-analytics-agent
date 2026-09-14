@@ -68,8 +68,8 @@ MEASURES = [
      "spend / purchases over the same period and grouping; null when spend = 0 or purchases = 0."),
     ("roas", "number", "number_2", None, "ROAS", "revenue / spend; null when spend = 0."),
     ("cpc", "number", "currency_2", "USD", "CPC", "spend / clicks; null when clicks = 0."),
-    ("cpm", "number", "currency_2", "USD", "CPM", "spend per 1,000 impressions; null when impressions = 0"),
-    ("ctr", "number", "percent_2", None, "CTR", "clicks / impressions; null when impressions = 0"),
+    ("cpm", "number", "currency_2", "USD", "CPM", "spend per 1,000 impressions; null when impressions = 0."),
+    ("ctr", "number", "percent_2", None, "CTR", "clicks / impressions; null when impressions = 0."),
     ("conversion_rate", "number", "percent_1", None, "Conversion rate", "purchases / clicks; null when clicks = 0."),
     ("aov", "number", "currency_2", "USD", "Average order value", "revenue / purchases; null when purchases = 0."),
 ]

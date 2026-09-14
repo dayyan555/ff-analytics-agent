@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -18,10 +18,11 @@ from langchain_core.runnables import RunnableConfig
 from langchain_openrouter import ChatOpenRouter
 from openrouter.errors import OpenRouterError
 
+from app.models.plan import PLAN_RESPONSE_FORMAT
 from app.models.state import PlanReply
 
 MODEL_ID = "openrouter/free"
-ErrorKind = Literal["rate_limited", "data_policy", "unavailable"]
+LLMErrorKind = Literal["rate_limited", "data_policy", "unavailable"]
 
 
 class FreeInferenceViolation(Exception):
@@ -29,7 +30,7 @@ class FreeInferenceViolation(Exception):
 
 
 class LLMError(Exception):
-    def __init__(self, kind: ErrorKind, status: int | None, detail: str):
+    def __init__(self, kind: LLMErrorKind, status: int | None, detail: str):
         super().__init__(f"{kind} ({status}): {detail}")
         self.kind = kind
         self.status = status
@@ -91,21 +92,32 @@ def _classify(exc: Exception) -> LLMError:
     return LLMError("unavailable", None, f"{type(exc).__name__}: {str(exc)[:300]}")  # httpx timeouts etc.
 
 
+RELAXED_RESPONSE_FORMAT = {"type": "json_object"}
+_SCHEMA_UNSUPPORTED = re.compile(r"structured|response_format|json_schema", re.I)
+
+
 class OpenRouterPlanLLM:
-    """Production ``PlanLLM``: one planning request, one explicit 429 retry, nothing else."""
+    """Production ``PlanLLM``: one planning request, one explicit 429 retry, nothing else.
+
+    The request carries the Plan as a strict JSON schema so that models honouring
+    ``response_format`` return plain JSON. In practice the free router still routes to
+    models that ignore it, which is why ``interpret`` re-rolls and repairs; if the router
+    itself rejects the schema (HTTP 400), the process falls back to plain JSON mode.
+    """
 
     def __init__(self, api_key: str, app_title: str, app_url: str):
         self.calls = 0
+        self.response_format = PLAN_RESPONSE_FORMAT
         self._llm = ChatOpenRouter(
             model=MODEL_ID,
             api_key=api_key,
             temperature=0,
-            max_tokens=1200,
-            timeout=60_000,  # milliseconds
+            max_tokens=4000,  # reasoning models spend tokens before the JSON; free, so leave room
+            timeout=90_000,  # milliseconds; some free models are slow
             max_retries=0,  # no LangChain-side retry config ...
             model_kwargs={
                 "retries": None,  # ... and none from the OpenRouter SDK either
-                "response_format": {"type": "json_object"},
+                "response_format": PLAN_RESPONSE_FORMAT,
             },
             reasoning={"effort": "low"},
             openrouter_provider={"max_price": {"prompt": 0, "completion": 0}},
@@ -117,6 +129,8 @@ class OpenRouterPlanLLM:
         try:
             msg = self._invoke(messages, config)
         except OpenRouterError as exc:
+            if exc.status_code == 400 and self._relax_if_schema_unsupported(exc):
+                return self.plan(messages, config)  # one retry in plain JSON mode
             if exc.status_code != 429:
                 raise _classify(exc) from exc
             wait = _retry_after_seconds(exc.headers)
@@ -131,7 +145,11 @@ class OpenRouterPlanLLM:
             raise _classify(exc) from exc
 
         meta = msg.response_metadata or {}
-        cost = Decimal(str(meta["cost"])) if meta.get("cost") is not None else None
+        raw_cost = meta.get("cost")
+        try:
+            cost = Decimal(str(raw_cost)) if raw_cost is not None else None
+        except InvalidOperation as exc:
+            raise FreeInferenceViolation(f"cost is not numeric: {raw_cost!r}") from exc
         if cost is not None and cost == 0:
             cost = Decimal(0)  # the SDK parses cost as float; keep "0", not "0.0"
         reply = PlanReply(text=_content(msg), model_name=meta.get("model_name"), cost=cost)
@@ -142,9 +160,17 @@ class OpenRouterPlanLLM:
         self.calls += 1
         return self._llm.invoke(messages, config=config)
 
+    def _relax_if_schema_unsupported(self, exc: OpenRouterError) -> bool:
+        """Switch this process to plain JSON mode if the router rejected the strict schema."""
+        if self.response_format is RELAXED_RESPONSE_FORMAT or not _SCHEMA_UNSUPPORTED.search(exc.message or exc.body or ""):
+            return False
+        self.response_format = RELAXED_RESPONSE_FORMAT
+        self._llm.model_kwargs = {**self._llm.model_kwargs, "response_format": RELAXED_RESPONSE_FORMAT}
+        return True
+
 
 class FakePlanLLM:
-    """Offline ``PlanLLM`` for tests and examples: canned replies, or a raised exception."""
+    """Offline ``PlanLLM`` for the tests: canned replies, or a raised exception."""
 
     def __init__(
         self,

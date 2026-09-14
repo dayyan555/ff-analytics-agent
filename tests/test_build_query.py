@@ -252,11 +252,20 @@ def test_clarify_intent_passes_through(deps):
     assert build(deps, intent="clarify", measures=[], period=None)["outcome"] == "clarify"
 
 
-@pytest.mark.parametrize("measures", [["profit_margin"], ["first_date"], ["spend", "last_date"]])
-def test_unknown_or_internal_measure_is_unsupported(deps, measures):
+@pytest.mark.parametrize("measures", [["profit_margin"], ["first_date"], ["profit_margin", "last_date"]])
+def test_only_unknown_or_internal_measures_is_unsupported(deps, measures):
     out = build(deps, measures=measures)
     assert out["outcome"] == "unsupported"
-    assert out["rejected"]["measures"] == [m for m in measures if m != "spend"]
+    assert out["rejected"]["measures"] == measures
+
+
+def test_unknown_measures_next_to_known_ones_are_dropped_with_a_note(deps):
+    out = build(deps, measures=["spend", "last_date", "profit_margin"], order_by="profit_margin")
+    assert "outcome" not in out
+    assert out["cube_query"]["measures"] == [MP + "spend"]
+    assert out["plan"]["measures"] == ["spend"] and out["plan"]["order_by"] is None
+    assert out["notes"] == ["ignored unknown metric 'last_date' (not in the semantic layer)",
+                            "ignored unknown metric 'profit_margin' (not in the semantic layer)"]
 
 
 def test_unsupported_intent_echoes_the_unknown_name(deps):
@@ -309,3 +318,50 @@ def test_compare_with_one_side_outside_coverage_still_queries(deps):
 def test_compare_with_both_sides_outside_coverage_is_no_data(deps):
     out = build(deps, intent="compare", period="2026-01", compare_period="2026-02")
     assert out["outcome"] == "no_data" and "cube_query" not in out
+
+
+@pytest.mark.parametrize("text", [
+    '{"intent": "clarify", "measures": null, "dimension": null, "period": null, "compare_period": null, "filters": [], '
+    '"order_by": null, "direction": null, "limit": null, "granularity": null, "message": "Please specify"}}',  # null list + extra brace
+    '```json\n{"intent":"clarify","measures":[],"period":null}\n```',
+    'Sure, here it is: {"intent":"clarify","measures":[]} — let me know',
+    '<think>{ not json</think>{"intent":"clarify","measures":[]}',
+])
+def test_parse_plan_tolerates_real_free_model_output(text):
+    from app.models.plan import parse_plan
+    assert parse_plan(text).intent == "clarify"
+
+
+def test_filters_across_dimensions_are_anded_and_aliases_deduplicated(deps):
+    state = state_for(measures=["purchases"], dimension=None,
+                      filters=[{"dimension": "country", "value": "US"}, {"dimension": "country", "value": "usa"},
+                               {"dimension": "device", "value": "phone"}])
+    out = build_query(state, Runtime(context=deps()))
+    assert out["cube_query"]["filters"] == [
+        {"member": MP + "country", "operator": "equals", "values": ["US"]},
+        {"member": MP + "device", "operator": "equals", "values": ["mobile"]},
+    ]
+    assert out["cube_query"]["dimensions"] == [MP + "country"]  # the first filtered dimension groups
+
+
+@pytest.mark.parametrize("spoken, canonical", [
+    ("Spend", "spend"), ("ROAS", "roas"), ("cost per purchase", "cost_per_purchase"), ("CPA", "cost_per_purchase"),
+    ("Return on ad spend", "roas"), ("click-through rate", "ctr"), ("average order value", "aov"),
+])
+def test_metric_names_are_normalised_not_rejected(deps, spoken, canonical):
+    out = build_query(state_for(measures=[spoken], dimension="Channel"), Runtime(context=deps()))
+    assert "outcome" not in out
+    assert out["cube_query"]["measures"][0] == MP + canonical and out["cube_query"]["dimensions"] == [MP + "channel"]
+    assert out["plan"]["measures"] == [canonical] and out["plan"]["dimension"] == "channel"
+
+
+def test_unknown_metric_stays_unknown_without_fuzzy_matching(deps):
+    out = build_query(state_for(measures=["conversions"]), Runtime(context=deps()))
+    assert out["outcome"] == "unsupported" and out["rejected"]["measures"] == ["conversions"]
+
+
+def test_superlative_question_without_order_by_is_still_a_ranking(deps):
+    state = state_for(measures=["purchases"], dimension="campaign_name", order_by=None)
+    state["question"] = "Which campaign generated the most purchases?"
+    out = build_query(state, Runtime(context=deps()))
+    assert out["plan"]["order_by"] == "purchases" and "ranked by purchases (inferred from the question)" in out["notes"]

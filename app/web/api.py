@@ -27,11 +27,11 @@ from pydantic import BaseModel, Field
 from app.models.state import Deps
 from app.runtime import build_cube, build_llm, lf, run_question, trace_url_for
 from app.tools.cube import load_catalog
+from app.tools.llm import MODEL_ID
 from app.web.questions import EXAMPLE_QUESTIONS
 
 log = logging.getLogger(__name__)
 STATIC_INDEX = Path(__file__).parent / "static" / "index.html"
-MODEL_ID = "openrouter/free"
 
 PAYLOAD_KEYS = (
     "question", "as_of", "outcome", "error_kind", "error", "error_stage", "answer", "answer_body", "footer",
@@ -44,7 +44,7 @@ ERROR_STATUS = {"cube": 503, "llm": 502, "free_guard": 502, "validation": 502, "
 
 
 class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=500)
+    question: str = Field(min_length=1, max_length=1500)  # room for a stitched clarification follow-up
     as_of: date | None = None
 
 
@@ -135,11 +135,9 @@ def ensure_catalog(app: FastAPI, *, force: bool = True) -> Any:
                 state.catalog = state.loader(state.cube)
                 state.catalog_error = None
             except Exception as exc:  # CubeError or a transport failure
-                state.catalog_error = (
-                    f"The semantic layer is unreachable ({exc}, {state.cube.base_url}). No answer was produced."
-                )
+                state.catalog_error = f"The semantic layer is unreachable ({str(exc)[:160]}). No answer was produced."
                 state.catalog_retry_at = time.monotonic() + CATALOG_RETRY_S
-                log.error("catalog unavailable: %s", state.catalog_error)
+                log.error("catalog unavailable at %s: %s", state.cube.base_url, exc)
             finally:
                 _flush()
         return state.catalog

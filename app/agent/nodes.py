@@ -11,6 +11,7 @@ Responsibilities are deliberately separate:
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -22,42 +23,53 @@ from langgraph.runtime import Runtime
 from app.agent import answer as templates
 from app.agent.dates import Period, PeriodError, overlap, periods_overlap, resolve
 from app.agent.prompt import build_messages, repair_message
-from app.models.catalog import COST_LIKE, RATIOS
+from app.models.catalog import COST_LIKE, RATIOS, safe_name
 from app.models.plan import Plan, parse_plan
 from app.models.state import AgentState, Deps
 from app.tools.cube import CubeError
 from app.tools.llm import FreeInferenceViolation, LLMError
 
 CUBE_LIMIT = 50
+_SUPERLATIVE = re.compile(r"\b(most|highest|top|best|least|lowest|bottom|worst|strongest|weakest)\b", re.I)
 DEFAULT_TOP_N = 10
 RECOMPUTE_TOLERANCE = Decimal("0.001")  # relative
 
 
 # --------------------------------------------------------------------------- interpret
 
+MAX_PLAN_ATTEMPTS = 3  # planning attempts per question (each may retry once on a 429)
+
+
 def interpret(state: AgentState, runtime: Runtime[Deps], config: RunnableConfig) -> dict[str, Any]:
+    """The only LLM call: question -> Plan.
+
+    An empty or off-task reply (no JSON object at all — e.g. a content-safety model
+    answering "User Safety: safe") is re-rolled with a fresh request; a malformed JSON
+    reply gets one repair turn with the error fed back. At most MAX_PLAN_ATTEMPTS attempts.
+    """
     deps = runtime.context
     before = deps.llm.calls
-    messages = build_messages(state["question"], deps.catalog, deps.as_of)
+    base_messages = build_messages(state["question"], deps.catalog, deps.as_of)
+    messages = base_messages
     out: dict[str, Any] = {"plan_raw": None, "plan": None, "llm_model": None, "llm_cost": None}
+    repaired = False
     try:
-        reply = deps.llm.plan(messages, config)
-        out["plan_raw"], out["llm_model"] = reply.text, reply.model_name
-        out["llm_cost"] = str(reply.cost) if reply.cost is not None else None
-        try:
-            plan = parse_plan(reply.text)
-        except OutputParserException as exc:  # one repair turn, with the error fed back
-            messages = [*messages, AIMessage(content=reply.text), repair_message(str(exc))]
+        for _attempt in range(MAX_PLAN_ATTEMPTS):
             reply = deps.llm.plan(messages, config)
             out["plan_raw"], out["llm_model"] = reply.text, reply.model_name
             out["llm_cost"] = str(reply.cost) if reply.cost is not None else None
             try:
-                plan = parse_plan(reply.text)
-            except OutputParserException:
-                # never echo the model's text: it may contain anything
-                out.update(outcome="error", error_kind="llm", error="the reply was not a valid plan (after one repair attempt)")
+                out["plan"] = parse_plan(reply.text).model_dump()
                 return _with_calls(out, deps, before)
-        out["plan"] = plan.model_dump()
+            except OutputParserException as exc:
+                if "{" in reply.text and not repaired:  # looks like JSON: one repair turn
+                    messages = [*base_messages, AIMessage(content=reply.text), repair_message(str(exc))]
+                    repaired = True
+                else:  # empty / off-task: re-roll the router with a clean request
+                    messages = base_messages
+        # never echo the model's text: it may contain anything
+        out.update(outcome="error", error_kind="llm",
+                   error=f"the reply was not a valid plan ({MAX_PLAN_ATTEMPTS} attempts)")
     except LLMError as exc:
         out.update(outcome="error", error_kind="llm", error=f"{exc.kind}: {exc.detail}")
     except FreeInferenceViolation as exc:
@@ -83,20 +95,32 @@ def build_query(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any]:
     if plan.intent == "clarify":
         return {"outcome": "clarify"}
 
-    # 1. every name the model used must exist in the semantic layer
-    unknown_measures = [m for m in plan.measures if m not in cat.measures]
-    bad_dimension = plan.dimension if plan.dimension and plan.dimension not in cat.dimensions else None
+    # 1. every name the model used must exist in the semantic layer (case, spaces and common
+    #    synonyms are normalised first: "ROAS", "cost per purchase" are not user errors)
+    resolved = {m: cat.match_measure(m) for m in plan.measures}
+    unknown_measures = [m for m, r in resolved.items() if r is None]
+    known_measures = list(dict.fromkeys(r for r in resolved.values() if r))
+    ignored: list[str] = []
+    if unknown_measures and known_measures and plan.intent != "unsupported":
+        # answer what the semantic layer has, and say what it does not have
+        ignored, unknown_measures = unknown_measures, []
+    order_by = cat.match_measure(plan.order_by) if plan.order_by else None
+    plan = plan.model_copy(update={"measures": known_measures, "order_by": order_by if order_by in known_measures else None})
+    dimension_name = cat.match_dimension(plan.dimension) if plan.dimension else None
+    bad_dimension = plan.dimension if plan.dimension and dimension_name is None else None
+    plan = plan.model_copy(update={"dimension": dimension_name})
     filters: list[tuple[str, str]] = []
     bad_values: list[dict[str, str]] = []
     for f in plan.filters:
-        if f.dimension not in cat.dimensions:
+        dim = cat.match_dimension(f.dimension)
+        if dim is None:
             bad_dimension = bad_dimension or f.dimension
             continue
-        canonical = cat.match_value(f.dimension, f.value)
+        canonical = cat.match_value(dim, f.value)
         if canonical:
-            filters.append((f.dimension, canonical))
+            filters.append((dim, canonical))
         else:
-            bad_values.append({"dimension": f.dimension, "value": f.value})
+            bad_values.append({"dimension": dim, "value": f.value})
     if plan.intent == "unsupported" or unknown_measures or bad_dimension or bad_values:
         nothing_named = not (unknown_measures or bad_dimension or bad_values)
         return {"outcome": "unsupported", "rejected": {
@@ -108,9 +132,9 @@ def build_query(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any]:
 
     # 2. periods are resolved by code, never by the model
     if plan.period is None:
-        return {"outcome": "clarify", "notes": ["no period was given"]}
+        return {"outcome": "clarify", "notes": ["no period was given"], "plan": plan.model_dump()}
     if plan.intent == "compare" and plan.compare_period is None:
-        return {"outcome": "clarify", "notes": ["compare with which period?"]}
+        return {"outcome": "clarify", "notes": ["compare with which period?"], "plan": plan.model_dump()}
     assert cat.coverage is not None
     try:
         period = resolve(plan.period, runtime.context.as_of, cat.coverage)
@@ -132,6 +156,7 @@ def build_query(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any]:
     if all(c == "none" for c in coverages):
         return {**out, "outcome": "no_data"}
     notes = [p.coverage_note for p in (period, compare) if p and p.coverage_note]
+    notes += [f"ignored unknown metric '{safe_name(m)}' (not in the semantic layer)" for m in ignored[:5]]
 
     # 3. the query itself
     measures = list(plan.measures)
@@ -139,9 +164,15 @@ def build_query(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any]:
         for part in RATIOS.get(m, ())[:2]:
             if part not in measures:
                 measures.append(part)
-    dimension = plan.dimension or (filters[0][0] if filters else None)  # rule 13a: a filtered dimension groups
+    # group by the filtered dimension when no grouping was asked for: an empty match then
+    # returns zero rows instead of one row of zeros
+    dimension = plan.dimension or (filters[0][0] if filters else None)
     order_by = plan.order_by or measures[0]
     direction = plan.direction or ("asc" if order_by in COST_LIKE else "desc")
+    if plan.order_by is None and dimension and _SUPERLATIVE.search(state["question"]):
+        # the question asks for a ranking but the model left order_by empty: rank by the first metric
+        plan = plan.model_copy(update={"order_by": order_by})
+        notes.append(f"ranked by {order_by} (inferred from the question)")
 
     mp = cat.member
     time_dimension: dict[str, Any] = {"dimension": cat.time_dimension}
@@ -163,6 +194,7 @@ def build_query(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any]:
     query["order"] = {mp(dimension): "asc"} if (compare and dimension) else {mp(order_by): direction}
     query["limit"] = CUBE_LIMIT
     query["timezone"] = "UTC"
+    out["plan"] = plan.model_dump()  # the plan actually executed (names normalised, unknown metrics removed)
     return {**out, "cube_query": query, "notes": notes}
 
 
@@ -232,9 +264,12 @@ def validate_results(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any
         parsed_sets.append(parsed)
 
     additive = [m for m in measures if m not in RATIOS]
-    # rule 13b: an ungrouped query over an empty set yields one row of zeros, not zero rows
+    # an ungrouped SUM over an empty set is one row of zeros — treat it as no data
     if dimension is None and all(_single_all_zero_row(rows, additive) for rows in parsed_sets if rows):
         return {"outcome": "no_data"}
+    if any(len(rows) >= CUBE_LIMIT for rows in parsed_sets):  # totals would be over a truncated set
+        return {"outcome": "error", "error_kind": "validation",
+                "error": f"more than {CUBE_LIMIT} groups in the result; totals would be incomplete"}
 
     caveats: list[str] = []
     for rows in parsed_sets:  # runtime proof that Cube's ratios are what we say they are
@@ -286,7 +321,7 @@ def validate_results(state: AgentState, runtime: Runtime[Deps]) -> dict[str, Any
         result["deltas"] = {"rows": rows, "totals": {"a": ta, "b": tb, "delta": _deltas(ta, tb, measures)},
                             "empty_side": "a" if not a_rows else ("b" if not b_rows else None)}
 
-    return {"result": result, "outcome": "answer", "notes": []}
+    return {"result": result, "outcome": "answer"}
 
 
 def _single_all_zero_row(rows: list[dict[str, Any]], additive: list[str]) -> bool:

@@ -7,13 +7,11 @@ UI, the footer and the README all agree on what a metric looks like.
 
 from __future__ import annotations
 
-import re
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from app.models.catalog import RATIOS, Catalog, Member
+from app.models.catalog import RATIOS, Catalog, Member, format_name, safe_name
 from app.models.state import AgentState
-from app.tools.cube import format_name
 
 
 # --------------------------------------------------------------------------- formatting
@@ -91,14 +89,6 @@ def render(state: AgentState, catalog: Catalog) -> tuple[str, str]:
 
 # --------------------------------------------------------------------------- outcome messages
 
-_SAFE_NAME = re.compile(r"[A-Za-z0-9_ .\-]{1,40}")
-
-
-def _safe_name(text: Any) -> str:
-    """Model-supplied names are echoed only if they look like names (bounded, plain characters)."""
-    text = str(text)
-    return text if _SAFE_NAME.fullmatch(text) else "an unrecognised name"
-
 
 def _coverage(catalog: Catalog) -> str:
     first, last = catalog.coverage or (None, None)
@@ -106,24 +96,33 @@ def _coverage(catalog: Catalog) -> str:
 
 
 def _clarify(state: AgentState, catalog: Catalog) -> str:
+    """Ask only for what is missing: the metric, the period, or both."""
+    plan = state.get("plan") or {}
     reasons = "; ".join(state.get("notes", []))
-    metrics = ", ".join(catalog.measures)
-    text = (
-        "I need one more detail to answer this. Which period do you mean (for example 'last month', "
-        f"'2026-07', or '2026-07-01..2026-07-31'; data covers {_coverage(catalog)}), and which metric ({metrics})?"
-    )
+    has_metric = bool(plan.get("measures")) and all(m in catalog.measures for m in plan["measures"])
+    has_period = bool(plan.get("period")) and not any("period" in r for r in state.get("notes", []))
+    period_q = (f"which period do you mean (for example 'last month', '2026-07', or '2026-07-01..2026-07-31'; "
+                f"data covers {_coverage(catalog)})")
+    metric_q = f"which metric ({', '.join(catalog.measures)})"
+    if has_metric and not has_period:
+        ask = period_q
+    elif has_period and not has_metric:
+        ask = metric_q
+    else:
+        ask = f"{period_q}, and {metric_q}"
+    text = f"I need one more detail to answer this: {ask}?"
     return f"{text}\nReason: {reasons}." if reasons else text
 
 
 def _unsupported(state: AgentState, catalog: Catalog) -> str:
     rejected = state.get("rejected") or {}
     lines = ["I can't answer that from the semantic layer."]
-    lines += [f"Unknown metric '{_safe_name(m)}'." for m in rejected.get("measures", [])[:5]]
+    lines += [f"Unknown metric '{safe_name(m)}'." for m in rejected.get("measures", [])[:5]]
     if rejected.get("dimension"):
-        lines.append(f"Unknown dimension '{_safe_name(rejected['dimension'])}'.")
+        lines.append(f"Unknown dimension '{safe_name(rejected['dimension'])}'.")
     for fv in rejected.get("filter_values", [])[:5]:
         pool = catalog.values.get(fv["dimension"], [])
-        lines.append(f"No {fv['dimension'].replace('_', ' ')} named '{_safe_name(fv['value'])}'. Known: {', '.join(pool)}.")
+        lines.append(f"No {fv['dimension'].replace('_', ' ')} named '{safe_name(fv['value'])}'. Known: {', '.join(pool)}.")
     if rejected.get("feature"):
         lines.append(f"Not supported yet: {rejected['feature']}.")
     lines.append(f"Available metrics: {', '.join(catalog.measures)}. Dimensions: {', '.join(catalog.dimensions)}.")

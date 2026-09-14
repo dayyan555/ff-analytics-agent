@@ -46,7 +46,7 @@ def test_index_serves_the_ui(catalog):
     with client_for(catalog) as client:
         resp = client.get("/")
     assert resp.status_code == 200 and resp.headers["cache-control"] == "no-store"
-    assert 'id="ask-btn"' in resp.text
+    assert 'id="send"' in resp.text
 
 
 def test_ask_clarify_is_200_without_cube_calls(catalog):
@@ -109,7 +109,7 @@ def test_catalog_failure_is_503_and_retried_lazily(catalog):
         assert client.get("/health").json()["catalog_error"] is None
 
 
-@pytest.mark.parametrize("payload", [{"question": ""}, {}, {"question": "x" * 501}, {"question": "q", "as_of": "not-a-date"}])
+@pytest.mark.parametrize("payload", [{"question": ""}, {}, {"question": "x" * 1501}, {"question": "q", "as_of": "not-a-date"}])
 def test_bad_request_keeps_the_payload_shape(catalog, payload):
     with client_for(catalog) as client:
         resp = client.post("/ask", json=payload)

@@ -1,4 +1,4 @@
-.PHONY: sync seed serve examples test graph cube-check check-secrets
+.PHONY: sync seed serve examples eval test graph cube-check check-secrets
 
 sync:
 	uv sync --extra seed
@@ -11,6 +11,10 @@ serve:
 
 examples:
 	uv run python examples.py
+
+# Plan accuracy of the real model on evals/plan_cases.json (one request per case; no Cube queries).
+eval:
+	uv run python evals/plan_accuracy.py
 
 test:
 	uv run pytest -q

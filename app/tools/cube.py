@@ -17,7 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from langfuse import get_client, observe
 
-from app.models.catalog import INTERNAL, VIEW, Catalog, Member
+from app.models.catalog import INTERNAL, VIEW, Catalog, Member, format_name
 
 CONTINUE_WAIT = "Continue wait"
 
@@ -33,6 +33,8 @@ class CubeError(Exception):
 
 class CubeClient:
     def __init__(self, base_url: str, api_secret: str, *, timeout: float = 30.0, max_wait_s: float = 120.0):
+        if not base_url or not api_secret:
+            raise CubeError(None, "CUBE_URL and CUBEJS_API_SECRET must be set")
         self.base_url = base_url.rstrip("/")
         self._secret = api_secret
         self._max_wait_s = max_wait_s
@@ -73,8 +75,8 @@ class CubeClient:
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
             resp = self._http.request(method, f"{self.base_url}{path}", json=body, headers=self._headers())
-        except httpx.HTTPError as exc:
-            raise CubeError(None, f"{type(exc).__name__}: {exc}") from exc
+        except (httpx.HTTPError, jwt.PyJWTError) as exc:
+            raise CubeError(None, f"{type(exc).__name__}: {str(exc)[:200]}") from exc
         try:
             data = resp.json()
         except ValueError:
@@ -121,14 +123,6 @@ class Cube:
 
 # -- catalog ---------------------------------------------------------------
 
-def format_name(value: Any) -> str | None:
-    """Cube reports a named format either as a string ("currency_2") or, for named numeric
-    formats, as an object {"type": "custom-numeric", "value": "$,.2~f", "alias": "currency_2"}."""
-    if isinstance(value, dict):
-        return value.get("alias") or value.get("type")
-    return value
-
-
 def _member(entry: dict[str, Any]) -> Member:
     name = entry["name"]
     return Member(
@@ -151,7 +145,7 @@ def _as_date(value: Any) -> date:
 @observe(name="cube.catalog", as_type="tool", capture_input=False)  # the Cube object holds the API secret
 def load_catalog(cube: Cube) -> Catalog:
     """Read the view's vocabulary from ``/meta`` and the data coverage from one ``/load``."""
-    get_client().update_current_span(input={"cube_url": cube.base_url, "view": VIEW})
+    get_client().update_current_span(input={"view": VIEW})
     meta = cube.meta()
     view = next((c for c in meta.get("cubes", []) if c.get("name") == VIEW), None)
     if view is None:
