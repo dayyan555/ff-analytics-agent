@@ -121,6 +121,14 @@ class Cube:
 
 # -- catalog ---------------------------------------------------------------
 
+def format_name(value: Any) -> str | None:
+    """Cube reports a named format either as a string ("currency_2") or, for named numeric
+    formats, as an object {"type": "custom-numeric", "value": "$,.2~f", "alias": "currency_2"}."""
+    if isinstance(value, dict):
+        return value.get("alias") or value.get("type")
+    return value
+
+
 def _member(entry: dict[str, Any]) -> Member:
     name = entry["name"]
     return Member(
@@ -130,7 +138,7 @@ def _member(entry: dict[str, Any]) -> Member:
         short_title=entry.get("shortTitle") or entry.get("title") or name,
         type=entry.get("type", ""),
         agg_type=entry.get("aggType"),
-        format=entry.get("format"),
+        format=format_name(entry.get("format")),
         currency=entry.get("currency"),
         description=entry.get("description") or "",
     )

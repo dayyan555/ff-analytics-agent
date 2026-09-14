@@ -13,6 +13,7 @@ from typing import Any
 
 from app.models.catalog import RATIOS, Catalog, Member
 from app.models.state import AgentState
+from app.tools.cube import format_name
 
 
 # --------------------------------------------------------------------------- formatting
@@ -58,7 +59,7 @@ class _Fmt:
 
     def value(self, short: str, value: Decimal | None) -> str:
         entry = self.ann.get(self.catalog.member(short), {})
-        return format_value(value, self.catalog.measures.get(short), entry.get("format"), entry.get("currency"))
+        return format_value(value, self.catalog.measures.get(short), format_name(entry.get("format")), entry.get("currency"))
 
     def title(self, short: str) -> str:
         entry = self.ann.get(self.catalog.member(short), {})

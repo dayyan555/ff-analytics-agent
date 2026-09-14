@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Langfuse reads its own env; with keys absent the SDK still tries to export (401 noise),
+# so declare tracing off unless both keys are present.
+if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+    os.environ["LANGFUSE_TRACING_ENABLED"] = "false"
+
 
 @dataclass(frozen=True)
 class Settings:
