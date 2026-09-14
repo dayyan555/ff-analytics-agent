@@ -1,0 +1,32 @@
+# Campaign master data (one row per campaign).
+cubes:
+  - name: campaigns
+    description: "Marketing campaigns: one row per campaign with its name, channel, country and objective."
+    sql_table: marketing.campaigns
+
+    dimensions:
+      - name: campaign_id
+        sql: campaign_id
+        type: number
+        primary_key: true
+        public: false
+
+      - name: campaign_name
+        sql: campaign_name
+        type: string
+        description: "Campaign name"
+
+      - name: channel
+        sql: channel
+        type: string
+        description: "Marketing channel: google, meta, tiktok, linkedin or email"
+
+      - name: country
+        sql: country
+        type: string
+        description: "Country the campaign runs in: US, UK or DE"
+
+      - name: objective
+        sql: objective
+        type: string
+        description: "Campaign objective: awareness, conversion or retention"

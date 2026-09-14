@@ -1,0 +1,29 @@
+# The only entry point the application queries; members are marketing_performance.<name>.
+views:
+  - name: marketing_performance
+    description: "Daily marketing performance by campaign, channel, country, objective and device."
+    cubes:
+      - join_path: campaign_daily
+        includes:
+          - spend
+          - impressions
+          - clicks
+          - purchases
+          - revenue
+          - cost_per_purchase
+          - roas
+          - cpc
+          - cpm
+          - ctr
+          - conversion_rate
+          - aov
+          - first_date
+          - last_date
+          - date
+          - device
+      - join_path: campaign_daily.campaigns
+        includes:
+          - campaign_name
+          - channel
+          - country
+          - objective

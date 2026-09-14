@@ -1,0 +1,137 @@
+# Single wide fact cube: ad_spend rows and purchase events stacked with a plain UNION ALL
+# (no aggregation in cube-level SQL); every measure sums or divides over this table.
+cubes:
+  - name: campaign_daily
+    description: "Daily spend rows (by spend date) and purchase events (by purchase date) per campaign and device, UTC."
+    sql: >
+      SELECT 'spend' AS src, campaign_id, date, device, toUInt32(0) AS purchase_id,
+             spend, impressions, clicks, toUInt32(0) AS purchases, CAST(0 AS Decimal(12,2)) AS revenue
+      FROM marketing.ad_spend
+      UNION ALL
+      SELECT 'purchase' AS src, campaign_id, toDate(purchased_at) AS date, device, purchase_id,
+             CAST(0 AS Decimal(12,2)) AS spend, toUInt32(0) AS impressions, toUInt32(0) AS clicks,
+             toUInt32(1) AS purchases, revenue
+      FROM marketing.purchases
+
+    joins:
+      - name: campaigns
+        relationship: many_to_one
+        sql: "{CUBE}.campaign_id = {campaigns.campaign_id}"
+
+    dimensions:
+      # Unique per row: src + campaign + date + device + purchase_id (purchase_id is 0 for spend rows).
+      - name: id
+        sql: "concat({CUBE}.src, '-', toString({CUBE}.campaign_id), '-', toString({CUBE}.date), '-', {CUBE}.device, '-', toString({CUBE}.purchase_id))"
+        type: string
+        primary_key: true
+        public: false
+
+      - name: date
+        sql: date
+        type: time
+        description: "Calendar day (UTC). Spend is booked on the spend date, purchases on the purchase date."
+
+      - name: device
+        sql: device
+        type: string
+        description: "Device the ad was served on / the purchase was made on: mobile or desktop."
+
+    measures:
+      - name: spend
+        sql: spend
+        type: sum
+        format: currency_2
+        currency: USD
+        description: "Total advertising spend in USD in the period."
+
+      - name: impressions
+        sql: impressions
+        type: sum
+        format: number_0
+        description: "Ad impressions in the period."
+
+      - name: clicks
+        sql: clicks
+        type: sum
+        format: number_0
+        description: "Ad clicks in the period."
+
+      - name: purchases
+        sql: purchases
+        type: sum
+        format: number_0
+        description: "Purchase events attributed to the campaign, counted on the purchase date (UTC)."
+
+      - name: revenue
+        sql: revenue
+        type: sum
+        format: currency_2
+        currency: USD
+        description: "Purchase revenue in USD (no refunds)."
+
+      # Ratios: toFloat64 avoids Decimal/integer truncation; NULLIF yields null instead of a division error.
+      - name: cost_per_purchase
+        title: "Cost per purchase"
+        sql: "NULLIF(toFloat64({spend}), 0) / NULLIF({purchases}, 0)"
+        type: number
+        format: currency_2
+        currency: USD
+        description: "spend / purchases over the same period and grouping; null when spend = 0 or purchases = 0."
+
+      - name: roas
+        title: "ROAS"
+        sql: "toFloat64({revenue}) / NULLIF(toFloat64({spend}), 0)"
+        type: number
+        format: number_2
+        description: "revenue / spend; null when spend = 0."
+
+      - name: cpc
+        title: "CPC"
+        sql: "toFloat64({spend}) / NULLIF({clicks}, 0)"
+        type: number
+        format: currency_2
+        currency: USD
+        description: "spend / clicks; null when clicks = 0."
+
+      - name: cpm
+        title: "CPM"
+        sql: "toFloat64({spend}) * 1000 / NULLIF({impressions}, 0)"
+        type: number
+        format: currency_2
+        currency: USD
+        description: "spend per 1,000 impressions; null when impressions = 0."
+
+      - name: ctr
+        title: "CTR"
+        sql: "toFloat64({clicks}) / NULLIF({impressions}, 0)"
+        type: number
+        format: percent_2
+        description: "clicks / impressions; null when impressions = 0."
+
+      - name: conversion_rate
+        title: "Conversion rate"
+        sql: "toFloat64({purchases}) / NULLIF({clicks}, 0)"
+        type: number
+        format: percent_1
+        description: "purchases / clicks; null when clicks = 0."
+
+      - name: aov
+        title: "Average order value"
+        sql: "toFloat64({revenue}) / NULLIF({purchases}, 0)"
+        type: number
+        format: currency_2
+        currency: USD
+        description: "revenue / purchases; null when purchases = 0."
+
+      # Data coverage bounds (internal to the app; not offered to the LLM as metrics).
+      - name: first_date
+        title: "First date"
+        sql: "min({CUBE}.date)"
+        type: time
+        description: "Earliest day with data (coverage lower bound)."
+
+      - name: last_date
+        title: "Last date"
+        sql: "max({CUBE}.date)"
+        type: time
+        description: "Latest day with data (coverage upper bound)."

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marketing analytics agent</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1f2328; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb;
+          --green:#15803d; --amber:#b45309; --purple:#6d28d9; --blue:#1d4ed8; --red:#b91c1c; --grey:#4b5563; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:900px; margin:0 auto; padding:24px 16px 48px; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-bottom:16px; }
+  h1 { font-size:20px; margin:0; }
+  #status { font-size:12px; color:var(--muted); background:var(--card); border:1px solid var(--line); border-radius:999px; padding:4px 10px; }
+  #status.down { border-color:var(--red); color:var(--red); }
+  #examples { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+  .chip { font-size:12px; border:1px solid var(--line); background:var(--card); border-radius:999px; padding:4px 10px; cursor:pointer; }
+  .chip:hover { border-color:var(--accent); }
+  textarea { width:100%; min-height:72px; padding:10px; font:inherit; border:1px solid var(--line); border-radius:8px; resize:vertical; }
+  .row { display:flex; gap:10px; align-items:center; margin:8px 0 20px; }
+  input[type=date] { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  button { font:inherit; padding:8px 16px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:wait; }
+  .spinner { display:none; width:12px; height:12px; border:2px solid #fff; border-right-color:transparent; border-radius:50%; margin-right:6px; vertical-align:-2px; animation:spin .8s linear infinite; }
+  .busy .spinner { display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:20px; }
+  .badge { display:inline-block; font-size:12px; font-weight:600; color:#fff; border-radius:4px; padding:2px 8px; margin-bottom:10px; }
+  .badge.answer{background:var(--green)} .badge.clarify{background:var(--amber)} .badge.unsupported{background:var(--purple)}
+  .badge.no_data{background:var(--blue)} .badge.error{background:var(--red)} .badge.busy{background:var(--grey)}
+  pre { white-space:pre-wrap; word-break:break-word; margin:0; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  #answer { font:15px/1.5 inherit; }
+  #footer, #timing, #stage-note { font-size:12px; color:var(--muted); margin-top:10px; }
+  #stage-note { color:var(--red); }
+  details { margin-top:14px; } summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  .tabs { display:flex; gap:4px; margin:10px 0; }
+  .tabs button { background:transparent; color:var(--muted); border:1px solid var(--line); padding:4px 10px; font-size:12px; }
+  .tabs button.on { color:var(--accent); border-color:var(--accent); }
+  .panel { display:none; background:var(--bg); border-radius:6px; padding:10px; overflow:auto; max-height:420px; } .panel.on { display:block; }
+  table { border-collapse:collapse; font-size:12px; margin-bottom:12px; } th, td { border:1px solid var(--line); padding:3px 8px; text-align:left; }
+  caption { text-align:left; font-weight:600; padding-bottom:4px; }
+  #history { padding-left:20px; font-size:13px; } #history li { cursor:pointer; margin:3px 0; } #history li:hover { color:var(--accent); }
+  .note { font-size:12px; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>Marketing analytics agent</h1><span id="status">loading…</span></header>
+  <div id="examples"></div>
+  <textarea id="question" placeholder="Ask about spend, purchases, revenue, ROAS… by channel or campaign. Ctrl/Cmd+Enter to ask."></textarea>
+  <div class="row">
+    <label for="as_of">as of</label><input id="as_of" type="date">
+    <button id="ask-btn"><span class="spinner"></span>Ask <span id="elapsed"></span></button>
+  </div>
+
+  <section id="card" class="card" hidden>
+    <span id="badge" class="badge"></span>
+    <pre id="answer"></pre>
+    <div id="footer"></div>
+    <div id="timing"></div>
+    <div id="stage-note" hidden>graph not invoked — no LLM call was made</div>
+    <details>
+      <summary>Under the hood</summary>
+      <div class="tabs">
+        <button data-tab="plan" class="on">Plan</button><button data-tab="query">Cube query</button>
+        <button data-tab="rows">Rows</button><button data-tab="result">Result</button><button data-tab="trace">Trace</button>
+      </div>
+      <pre id="tab-plan" class="panel on"></pre><pre id="tab-query" class="panel"></pre>
+      <div id="tab-rows" class="panel"></div><pre id="tab-result" class="panel"></pre><div id="tab-trace" class="panel"></div>
+    </details>
+  </section>
+
+  <h2 style="font-size:15px;margin:0 0 6px">History</h2>
+  <ol id="history"></ol>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const PREFIX = "marketing_performance.";
+  const history = [];
+  let ticker = null;
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const pretty = (o) => (o === null || o === undefined) ? "null" : JSON.stringify(o, null, 2);
+
+  async function loadHealth() {
+    try {
+      const h = await (await fetch("/health")).json();
+      const cat = h.catalog && h.catalog.loaded
+        ? `catalog: ${h.catalog.measures.length}m/${h.catalog.dimensions.length}d, ${h.catalog.coverage.first}..${h.catalog.coverage.last}`
+        : "catalog: not loaded";
+      $("status").textContent = `Cube: ${h.cube} (${h.cube_url_kind}) · ${cat} · tracing: ${h.langfuse === "enabled" ? "on" : "off"} · ${h.model}`;
+      $("status").className = h.cube === "ok" && h.catalog.loaded ? "" : "down";
+      $("status").title = h.catalog_error || "";
+      if (!$("as_of").value) $("as_of").value = h.as_of;
+    } catch (e) { $("status").textContent = "server unreachable"; $("status").className = "down"; }
+  }
+
+  async function loadExamples() {
+    const { examples } = await (await fetch("/examples")).json();
+    $("examples").innerHTML = examples.map((e) =>
+      `<span class="chip" title="${esc(e.kind)} → ${esc(e.expect)}" data-q="${esc(e.question)}">${esc(e.question)}</span>`).join("");
+    $("examples").querySelectorAll(".chip").forEach((c) => c.onclick = () => { $("question").value = c.dataset.q; $("question").focus(); });
+  }
+
+  function setBusy(on) {
+    $("ask-btn").disabled = on; $("ask-btn").classList.toggle("busy", on);
+    clearInterval(ticker); $("elapsed").textContent = "";
+    if (on) { const t0 = Date.now(); ticker = setInterval(() => { $("elapsed").textContent = ((Date.now() - t0) / 1000).toFixed(1) + " s"; }, 100); }
+  }
+
+  async function ask() {
+    const question = $("question").value.trim();
+    if (!question) return;
+    setBusy(true);
+    const body = { question, as_of: $("as_of").value || null };
+    const t0 = Date.now();
+    try {
+      const r = await fetch("/ask", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const resp = await r.json();
+      history.unshift({ resp, status: r.status, elapsed: Date.now() - t0 });
+      render(resp, r.status); renderHistoryList();
+    } catch (e) {
+      render({ question, outcome: "error", error_kind: "network", answer_body: "Request failed: " + e.message, timing_ms: Date.now() - t0 }, 0);
+    } finally { setBusy(false); loadHealth(); }
+  }
+
+  function render(resp, status) {
+    $("card").hidden = false;
+    const kind = resp.error_kind === "busy" ? "busy" : resp.outcome;
+    $("badge").className = "badge " + kind;
+    $("badge").textContent = kind === "error" ? `error · ${resp.error_kind}${resp.error_stage === "catalog" ? " (catalog)" : ""}` : kind;
+    $("answer").textContent = resp.answer_body || resp.answer || "";
+    $("footer").textContent = resp.footer || "";
+    $("timing").textContent = `${((resp.timing_ms || 0) / 1000).toFixed(1)} s · llm calls ${resp.llm_calls ?? 0} · cube calls ${resp.cube_calls ?? 0} · HTTP ${status}`;
+    $("stage-note").hidden = resp.error_stage !== "catalog";
+    $("tab-plan").textContent = pretty(resp.plan);
+    $("tab-query").textContent = pretty(resp.cube_query);
+    $("tab-rows").innerHTML = (resp.rows || []).length ? resp.rows.map((set, i) => renderTable(set, resp.annotation, i, resp.rows.length)).join("") : '<span class="note">no rows</span>';
+    $("tab-result").textContent = pretty(resp.result);
+    $("tab-trace").innerHTML = traceHtml(resp);
+    setTab("plan");
+  }
+
+  function header(member, annotation) {
+    const a = annotation || {};
+    const m = (a.measures || {})[member] || (a.dimensions || {})[member] || (a.timeDimensions || {})[member];
+    return m && m.shortTitle ? m.shortTitle : member.replace(PREFIX, "");
+  }
+
+  function renderTable(rows, annotation, i, n) {
+    if (!rows.length) return `<table><caption>Row set ${i + 1} of ${n}</caption><tr><td>no rows</td></tr></table>`;
+    const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+    const head = cols.map((c) => `<th>${esc(header(c, annotation))}</th>`).join("");
+    const body = rows.map((r) => "<tr>" + cols.map((c) => `<td>${r[c] === null || r[c] === undefined ? "—" : esc(r[c])}</td>`).join("") + "</tr>").join("");
+    return `<table><caption>${n > 1 ? `Row set ${i + 1} of ${n}` : `${rows.length} row(s)`}</caption><tr>${head}</tr>${body}</table>`;
+  }
+
+  function traceHtml(resp) {
+    let line = "tracing disabled";
+    if (resp.trace_url) line = `<a href="${esc(resp.trace_url)}" target="_blank" rel="noopener">Open trace in Langfuse</a>`;
+    else if (resp.trace_id) line = `trace id: <code>${esc(resp.trace_id)}</code>`;
+    return `<div>${line}</div><div class="note">traces appear ~15–30 s after the answer</div>`;
+  }
+
+  function renderHistoryList() {
+    $("history").innerHTML = history.map((h, i) =>
+      `<li data-i="${i}">${esc(h.resp.outcome)} · ${esc(h.resp.question)}</li>`).join("");
+    $("history").querySelectorAll("li").forEach((li) => li.onclick = () => renderHistory(+li.dataset.i));
+  }
+  function renderHistory(i) { const h = history[i]; render(h.resp, h.status); window.scrollTo({ top: 0, behavior: "smooth" }); }
+
+  function setTab(name) {
+    document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === name));
+    document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("on", p.id === "tab-" + name));
+  }
+  document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => setTab(b.dataset.tab));
+  $("ask-btn").onclick = ask;
+  $("question").addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") ask(); });
+
+  loadHealth(); loadExamples(); setInterval(loadHealth, 10000);
+</script>
+</body>
+</html>
