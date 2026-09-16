@@ -2,11 +2,9 @@
 
 A focused, production-minded agent that answers marketing questions through **Cube over ClickHouse**. The model selects semantic queries; Cube defines and calculates the metrics; deterministic application code controls execution, checks the returned numbers, and renders the evidence.
 
-```text
-Browser → FastAPI → LangGraph → Cube REST → ClickHouse
-                       ├── OpenRouter free router
-                       └── Langfuse tracing
-```
+## Architecture
+
+![Marketing analytics agent runtime flow](docs/runtime-flow.png)
 
 ## Run it
 
