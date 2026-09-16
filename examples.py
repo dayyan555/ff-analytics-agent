@@ -1,12 +1,14 @@
 """Run the example questions end-to-end (``make examples``).
 
 Exercises the live stack (Cube Cloud + OpenRouter free router + Langfuse) with
-the same questions the UI offers, printing one block per question and a total.
+the same questions the UI offers, printing the tool calls and the answer per
+question and a total. Budget: about 3 model requests per question (7 model turns at most).
 Exit code 2 if the semantic layer is unreachable or any question ends in ``error``.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from decimal import Decimal
 
@@ -39,11 +41,14 @@ def main() -> int:
         refusals += out.get("error_kind") == "free_guard"
         verdict = "as expected" if outcome == example.expect else f"expected {example.expect}"
         print(f"[{i}/{total}] ({example.kind}) {example.question}")
+        models = ", ".join(dict.fromkeys(out.get("llm_models", []))) or "n/a"
         print(
-            f"outcome: {outcome} ({verdict}) · model: {out.get('llm_model') or 'n/a'}"
-            f" · llm calls: {out.get('llm_calls', 0)} · cube calls: {out.get('cube_calls', 0)}"
-            f" · trace: {out.get('trace_id') or 'n/a'}"
+            f"outcome: {outcome} ({verdict}) · models: {models}"
+            f" · model calls: {out.get('llm_calls', 0)} · tool calls: {len(out.get('steps', []))}"
+            f" · cube calls: {out.get('cube_calls', 0)} · trace: {out.get('trace_id') or 'n/a'}"
         )
+        for step in out.get("steps", []):
+            print(f"    {step['step']}. {step['tool']}({json.dumps(step['args'])[:100]}) -> {step['summary']}")
         for line in str(out.get("answer", "")).splitlines():
             print(f"    {line}".rstrip())
         print()

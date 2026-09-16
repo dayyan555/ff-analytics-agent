@@ -1,17 +1,16 @@
-"""Answer templates. Deterministic: every number comes from ``state["result"]``.
-
-Number formatting follows the semantic layer's own ``format``/``currency``
-metadata (from the ``/load`` annotation, falling back to ``/meta``), so the
-UI, the footer and the README all agree on what a metric looks like.
-"""
+"""Render the checked narrative alongside tables drawn directly from Cube rows."""
 
 from __future__ import annotations
 
-from decimal import ROUND_HALF_UP, Decimal
+import re
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
-from app.models.catalog import RATIOS, Catalog, Member, format_name, safe_name
+from app.models.catalog import Catalog, Member
 from app.models.state import AgentState
+from app.agent.verify import relevant_queries
+
+MAX_TABLE_ROWS = 20
 
 
 # --------------------------------------------------------------------------- formatting
@@ -30,8 +29,9 @@ def format_value(value: Decimal | None, member: Member | None, fmt: str | None =
     if base == "percent":
         p = int(precision) if precision else 1
         return f"{_trim(value * 100, p)}%"
-    p = int(precision) if precision else (0 if value == value.to_integral_value() else 2)
-    return _trim(value, p)
+    if precision:
+        return f"{value.quantize(Decimal(1).scaleb(-int(precision)), rounding=ROUND_HALF_UP):,.{int(precision)}f}"
+    return _trim(value, 0 if value == value.to_integral_value() else 2)
 
 
 def _trim(value: Decimal, precision: int) -> str:
@@ -39,227 +39,135 @@ def _trim(value: Decimal, precision: int) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _pct(value: Decimal | None, from_zero: bool) -> str:
-    if from_zero:
-        return "n/a (from 0)"
+def _cell(value: Any, column: dict[str, Any], catalog: Catalog) -> str:
     if value is None:
-        return "n/a"
-    sign = "+" if value >= 0 else ""
-    return f"{sign}{_trim(value * 100, 1)}%"
+        return "—"
+    if column.get("type") != "number":
+        return str(value)[:10] if column.get("type") == "time" else str(value)
+    try:
+        return format_value(Decimal(str(value)), catalog.member(column["name"]))
+    except InvalidOperation:
+        return str(value)
 
 
-class _Fmt:
-    """Formatter bound to one query's annotation (with catalog fallback)."""
+def table(query: dict[str, Any], catalog: Catalog) -> str:
+    """A plain-text table of one query's rows (capped), columns titled from the annotation."""
+    columns = query.get("columns") or []
+    rows = query.get("rows") or []
+    if not columns or not rows:
+        return ""
+    cells = [[_cell(r.get(c["key"]), c, catalog) for c in columns] for r in rows[:MAX_TABLE_ROWS]]
+    widths = [max(len(c["title"]), *(len(row[i]) for row in cells)) for i, c in enumerate(columns)]
+    align = [c.get("type") == "number" for c in columns]
 
-    def __init__(self, catalog: Catalog, annotation: dict[str, Any] | None):
-        self.catalog = catalog
-        self.ann = (annotation or {}).get("measures", {})
+    def line(values: list[str]) -> str:
+        return "  ".join(v.rjust(w) if a else v.ljust(w) for v, w, a in zip(values, widths, align)).rstrip()
 
-    def value(self, short: str, value: Decimal | None) -> str:
-        entry = self.ann.get(self.catalog.member(short), {})
-        return format_value(value, self.catalog.measures.get(short), format_name(entry.get("format")), entry.get("currency"))
-
-    def title(self, short: str) -> str:
-        entry = self.ann.get(self.catalog.member(short), {})
-        member = self.catalog.measures.get(short) or self.catalog.dimensions.get(short)
-        return entry.get("shortTitle") or (member.short_title if member else short)
-
-    def description(self, short: str) -> str:
-        entry = self.ann.get(self.catalog.member(short), {})
-        member = self.catalog.measures.get(short)
-        return entry.get("description") or (member.description if member else "")
+    out = [line([c["title"] for c in columns]), line(["-" * w for w in widths])]
+    out += [line(row) for row in cells]
+    if len(rows) > MAX_TABLE_ROWS:
+        out.append(f"… {len(rows) - MAX_TABLE_ROWS} more row(s) — see “Under the hood”")
+    if query.get("complete") is False:
+        out.append(query.get("note") or "These results are limited and may be incomplete.")
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------- entry point
 
 def render(state: AgentState, catalog: Catalog) -> tuple[str, str]:
     outcome = state.get("outcome", "error")
+    final = state.get("final") or {}
+    text = _plain(final.get("text") or "")
+    shown = _tables_to_show(state.get("queries", []))
     if outcome == "answer":
-        body = _render_result(state, catalog)
-    elif outcome == "clarify":
-        body = _clarify(state, catalog)
-    elif outcome == "unsupported":
-        body = _unsupported(state, catalog)
+        body = text or "Here is what the semantic layer returned."
+        for q in shown:
+            heading = f"{q.get('query_id', 'Result')} — {_query_scope(q)}\n" if len(shown) > 1 else ""
+            body += f"\n\n{heading}{table(q, catalog) or 'No matching rows.'}"
     elif outcome == "no_data":
-        body = _no_data(state, catalog)
+        body = text or "No rows matched this question in the semantic layer."
+        coverage = _coverage(catalog)
+        if coverage and coverage not in body:
+            body += f"\n(Data covers {coverage}.)"
+    elif outcome in ("clarify", "unsupported"):
+        body = text or ("Could you give me one more detail?" if outcome == "clarify"
+                        else "I can't answer that from the semantic layer.")
     else:
         body = _error(state)
+        if shown:  # the run failed after data came back: show the data, not the narrative
+            body += "\nThe rows the semantic layer returned before that:\n\n" + table(shown[-1], catalog)
     return body, _footer(state, catalog)
 
 
-# --------------------------------------------------------------------------- outcome messages
+def _tables_to_show(queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep each distinct successful query, including different periods/filters.
+
+    Only identical requests are deduplicated; the latest result wins.
+    """
+    return relevant_queries(queries)
+
+
+def _query_scope(query: dict[str, Any]) -> str:
+    periods = query.get("periods") or []
+    span = " vs ".join(f"{p['from']} to {p['to']}" for p in periods)
+    filters = query.get("query", {}).get("filters", [])
+    labels = [
+        f"{f['member'].split('.', 1)[-1]} {f.get('operator', '')} {', '.join(map(str, f.get('values', [])))}"
+        if "member" in f else str(f)
+        for f in filters
+    ]
+    return f"Period: {span or 'all available dates'} (UTC, inclusive) · Filters: {', '.join(labels) or 'none'}"
+
+
+_EMPHASIS = re.compile(r"(\*\*|__)(.+?)\1")
+_HEADING = re.compile(r"^#{1,6}\s*", re.M)
+
+
+def _plain(text: str) -> str:
+    """The narrative is shown as plain text: drop the markdown emphasis and heading markers models like to add."""
+    return _HEADING.sub("", _EMPHASIS.sub(r"\2", text)).strip()
 
 
 def _coverage(catalog: Catalog) -> str:
-    first, last = catalog.coverage or (None, None)
-    return f"{first} to {last}"
-
-
-def _clarify(state: AgentState, catalog: Catalog) -> str:
-    """Ask only for what is missing: the metric, the period, or both."""
-    plan = state.get("plan") or {}
-    reasons = "; ".join(state.get("notes", []))
-    has_metric = bool(plan.get("measures")) and all(m in catalog.measures for m in plan["measures"])
-    has_period = bool(plan.get("period")) and not any("period" in r for r in state.get("notes", []))
-    period_q = (f"which period do you mean (for example 'last month', '2026-07', or '2026-07-01..2026-07-31'; "
-                f"data covers {_coverage(catalog)})")
-    metric_q = f"which metric ({', '.join(catalog.measures)})"
-    if has_metric and not has_period:
-        ask = period_q
-    elif has_period and not has_metric:
-        ask = metric_q
-    else:
-        ask = f"{period_q}, and {metric_q}"
-    text = f"I need one more detail to answer this: {ask}?"
-    return f"{text}\nReason: {reasons}." if reasons else text
-
-
-def _unsupported(state: AgentState, catalog: Catalog) -> str:
-    rejected = state.get("rejected") or {}
-    lines = ["I can't answer that from the semantic layer."]
-    lines += [f"Unknown metric '{safe_name(m)}'." for m in rejected.get("measures", [])[:5]]
-    if rejected.get("dimension"):
-        lines.append(f"Unknown dimension '{safe_name(rejected['dimension'])}'.")
-    for fv in rejected.get("filter_values", [])[:5]:
-        pool = catalog.values.get(fv["dimension"], [])
-        lines.append(f"No {fv['dimension'].replace('_', ' ')} named '{safe_name(fv['value'])}'. Known: {', '.join(pool)}.")
-    if rejected.get("feature"):
-        lines.append(f"Not supported yet: {rejected['feature']}.")
-    lines.append(f"Available metrics: {', '.join(catalog.measures)}. Dimensions: {', '.join(catalog.dimensions)}.")
-    return "\n".join(lines)
-
-
-def _no_data(state: AgentState, catalog: Catalog) -> str:
-    period = state.get("period") or {}
-    query = state.get("cube_query")
-    span = f"{period.get('start')} to {period.get('end')}" if period else "that period"
-    if query is None:  # the requested period lies entirely outside the data
-        return f"Data covers {_coverage(catalog)}; there is nothing for {span}."
-    values = [v for f in query.get("filters", []) for v in f["values"]]
-    subject = f"for {', '.join(values)} " if values else ""
-    return (f"No rows {subject}between {period.get('start')} and {period.get('end')} "
-            f"(the warehouse covers {_coverage(catalog)}).")
+    spans = [v.coverage for v in catalog.views.values() if v.coverage]
+    if not spans:
+        return ""
+    return f"{min(s[0] for s in spans)} to {max(s[1] for s in spans)}"
 
 
 def _error(state: AgentState) -> str:
     kind, detail = state.get("error_kind"), state.get("error") or ""
-    if kind == "cube":
-        return f"The semantic layer returned an error ({detail}). No answer was produced."
     if kind == "free_guard":
-        return f"Refused: the router did not serve a demonstrably free model ({detail}). No answer was produced."
+        return f"Refused: the router did not return a demonstrably free model ({detail})."
+    if kind == "llm":
+        return f"The model call failed ({detail}). No answer was produced; please retry."
+    if kind == "cube":
+        return f"The semantic layer rejected the request ({detail}). No answer was produced."
+    if kind == "budget":
+        return f"I could not finish this question ({detail}). Try a simpler question."
     if kind == "validation":
-        return f"Unexpected response shape from the semantic layer ({detail}). No answer was produced."
-    model = state.get("llm_model") or "unknown"
-    return f"The model did not return a usable plan (routed model: {model}; {detail}). Please retry."
+        return f"I rejected the model's answer because it was not backed by the data ({detail})."
+    return f"Something went wrong ({detail or 'unknown error'})."
 
-
-# --------------------------------------------------------------------------- results
-
-def _render_result(state: AgentState, catalog: Catalog) -> str:
-    result = state["result"]
-    fmt = _Fmt(catalog, state.get("annotation"))
-    shape = result["shape"]
-    text = {"breakdown": _breakdown, "ranking": _ranking, "compare": _compare}[shape](state, result, fmt)
-    caveats = [*(state.get("notes") or []), *(result.get("caveats") or [])]
-    return text + ("\n\nCaveats: " + "; ".join(caveats) if caveats else "")
-
-
-def _label(period: dict[str, Any] | None) -> str:
-    return period.get("label", "") if period else ""
-
-
-def _breakdown(state: AgentState, result: dict[str, Any], fmt: _Fmt) -> str:
-    dim, measures = result["dimension"], result["requested"]
-    period = _label(state.get("period"))
-    titles = ", ".join(fmt.title(m) for m in measures)
-    lines = [f"{titles} by {fmt.title(dim).lower()}, {period}:" if dim else f"{titles}, {period} (total):"]
-    for row in result["rows"]:
-        cells = [f"{fmt.title(m)} {fmt.value(m, row['values'].get(m))}" for m in measures]
-        if "spend" in measures and (row["values"].get("spend") or 0) == 0:
-            cells[measures.index("spend")] += " (no paid media)"
-        lines.append(f"- {row['key']}: " + ", ".join(cells) if dim else "- " + ", ".join(cells))
-    totals = result.get("totals") or {}
-    if dim and totals and len(result["rows"]) > 1:
-        cells = [f"{fmt.title(m)} {fmt.value(m, totals[m])}" for m in measures if m in totals]
-        if cells:
-            lines.append("- Total: " + ", ".join(cells))
-    return "\n".join(lines)
-
-
-def _ranking(state: AgentState, result: dict[str, Any], fmt: _Fmt) -> str:
-    rank = result["ranking"]
-    by, winner = rank["by"], rank["winner"]
-    period = _label(state.get("period"))
-    superlative = "lowest" if rank["direction"] == "asc" else "highest"
-    if winner is None:
-        return f"No row has a defined {fmt.title(by)} for {period}."
-    detail = ""
-    if by in RATIOS:
-        num, den, factor = RATIOS[by]
-        detail = (f" ({fmt.title(num)} {fmt.value(num, winner['values'].get(num))} / {fmt.title(den)} "
-                  f"{fmt.value(den, winner['values'].get(den))}" + (f" × {factor:,}" if factor != 1 else "") + ")")
-    lines = [f"{winner['key']} has the {superlative} {fmt.title(by)} for {period}: {fmt.value(by, winner['values'][by])}{detail}."]
-    if rank["tied"]:
-        lines.append("Tied at the top: " + ", ".join(str(k) for k in rank["tied"]) + ".")
-    lines.append(f"Ranking by {fmt.title(by)}:")
-    for i, row in enumerate(rank["top"], 1):
-        others = [f"{fmt.title(m)} {fmt.value(m, row['values'].get(m))}" for m in result["requested"] if m != by]
-        lines.append(f"{i}. {row['key']}: {fmt.value(by, row['values'][by])}" + (f" ({', '.join(others)})" if others else ""))
-    if result["excluded"]:
-        lines.append("Excluded: " + "; ".join(f"{e['key']} ({e['reason']})" for e in result["excluded"]) + ".")
-    return "\n".join(lines)
-
-
-def _compare(state: AgentState, result: dict[str, Any], fmt: _Fmt) -> str:
-    deltas = result["deltas"]
-    a_label, b_label = _label(state.get("period")), _label(state.get("compare_period"))
-    dim, measures = result["dimension"], result["requested"]
-    lines: list[str] = []
-    if deltas["empty_side"]:
-        lines.append(f"No data in {a_label if deltas['empty_side'] == 'a' else b_label}.")
-    tot = deltas["totals"]
-    parts = []
-    for m in measures if not deltas["empty_side"] else []:  # totals are meaningless with an empty side
-        if m in tot["a"] and m in tot["b"]:
-            d = tot["delta"][m]
-            parts.append(f"{fmt.title(m)} {fmt.value(m, tot['a'][m])} → {fmt.value(m, tot['b'][m])} "
-                         f"({'+' if (d['delta'] or 0) >= 0 else ''}{fmt.value(m, d['delta'])}, {_pct(d['pct'], d['from_zero'])})")
-    if parts:
-        lines.append(f"Between {a_label} and {b_label}: " + "; ".join(parts) + ".")
-    lines.append(f"By {fmt.title(dim).lower() if dim else 'total'} ({a_label} → {b_label}):")
-    for row in deltas["rows"]:
-        cells = []
-        for m in measures:
-            a = fmt.value(m, row["a"].get(m)) if row["a"] else "no data"
-            b = fmt.value(m, row["b"].get(m)) if row["b"] else "no data"
-            d = row["delta"][m]
-            cells.append(f"{fmt.title(m)} {a} → {b} ({_pct(d['pct'], d['from_zero'])})")
-        flag = "" if row["status"] == "both" else f" [{row['status']}]"
-        lines.append(f"- {row['key'] if dim else 'total'}{flag}: " + "; ".join(cells))
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- footer
 
 def _footer(state: AgentState, catalog: Catalog) -> str:
     parts: list[str] = []
-    period, compare = state.get("period"), state.get("compare_period")
-    if period:
-        span = f"{period['start']} to {period['end']}"
-        if compare:
-            span += f" vs {compare['start']} to {compare['end']}"
-        parts.append(f"Period: {span} (UTC, inclusive)")
-    query = state.get("cube_query") or {}
-    filters = ", ".join(f"{f['member'].split('.', 1)[1]} = {v}" for f in query.get("filters", []) for v in f["values"])
-    parts.append(f"Filters: {filters or 'none'}")
-    fmt = _Fmt(catalog, state.get("annotation"))
-    plan = state.get("plan") or {}
-    if state.get("outcome") in ("answer", "no_data"):
-        for m in plan.get("measures", []):
-            if m in catalog.measures:
-                parts.append(f"{m} = {fmt.description(m)}")
-    if state.get("llm_model"):
-        parts.append(f"model: {state['llm_model']}")
+    shown = _tables_to_show(state.get("queries", []))
+    definitions: dict[str, str] = {}
+    for query in shown:
+        prefix = f"{query.get('query_id', 'Result')}: " if len(shown) > 1 else ""
+        parts.append(prefix + _query_scope(query))
+        if state.get("outcome") in ("answer", "no_data"):
+            for col in query.get("columns", []):
+                member = catalog.member(col.get("name", ""))
+                if member and member.kind == "measure" and member.description:
+                    definitions[member.name] = f"{member.short} = {member.description}"
+    parts.extend(definitions.values())
+    models = list(dict.fromkeys(state.get("llm_models", [])))
+    if models:
+        parts.append("model: " + ", ".join(models))
         parts.append(f"cost: ${state.get('llm_cost') or '0'}")
+    parts.append(f"model calls: {state.get('llm_calls', 0)}")
     parts.append(f"cube calls: {state.get('cube_calls', 0)}")
+    parts.append(f"tool calls: {len(state.get('steps', []))}")
     return " · ".join(parts)

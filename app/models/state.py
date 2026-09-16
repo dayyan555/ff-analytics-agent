@@ -8,31 +8,41 @@ from decimal import Decimal
 from operator import add
 from typing import Annotated, Any, Literal, NamedTuple, Protocol, TypedDict
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
+from langgraph.graph.message import add_messages
 
 from app.models.catalog import Catalog
 
 Outcome = Literal["answer", "clarify", "unsupported", "no_data", "error"]
-ErrorKind = Literal["free_guard", "llm", "cube", "validation"]
+ErrorKind = Literal["free_guard", "llm", "cube", "validation", "budget"]
+FinalKind = Literal["answer", "clarify", "unsupported"]
 
 
-class PlanReply(NamedTuple):
-    text: str
+class LLMReply(NamedTuple):
+    message: AIMessage
     model_name: str | None
     cost: Decimal | None
 
 
-class PlanLLM(Protocol):
-    """One planning call; ``calls`` counts HTTP requests actually made."""
+class AgentLLM(Protocol):
+    """One model call with the tool schemas attached; ``calls`` counts HTTP requests actually made."""
 
     calls: int
+    native_tools: bool  # False once the router proved it cannot route tool requests (JSON protocol only)
 
-    def plan(self, messages: list[BaseMessage], config: RunnableConfig | None = None) -> PlanReply: ...
+    def invoke(self, messages: list[BaseMessage], tools: list[BaseTool], config: RunnableConfig | None = None) -> LLMReply: ...
 
 
-class CubeTools(Protocol):
-    """The two LangChain tools wrapping the Cube REST API (see app/tools/cube.py)."""
+class CubeAPI(Protocol):
+    """The Cube REST calls the toolkit needs (see app/tools/cube.py)."""
+
+    base_url: str
+
+    def ready(self) -> bool: ...
+
+    def meta(self) -> dict: ...
 
     def dry_run(self, query: dict, config: RunnableConfig | None = None) -> dict: ...
 
@@ -41,34 +51,37 @@ class CubeTools(Protocol):
 
 @dataclass
 class Deps:
-    llm: PlanLLM
-    cube: CubeTools
+    llm: AgentLLM
+    cube: CubeAPI
     catalog: Catalog
     as_of: date
+
+
+class ToolCall(TypedDict):
+    id: str
+    name: str
+    args: dict[str, Any]
 
 
 class AgentState(TypedDict, total=False):
     # input
     question: str
     as_of: str
-    # interpret
-    plan_raw: str | None
-    plan: dict[str, Any] | None
-    llm_model: str | None
-    llm_cost: str | None
+    # the conversation the model sees (system + question + tool calls + tool results)
+    messages: Annotated[list[BaseMessage], add_messages]
+    # agent
     llm_calls: int
-    # build_query
-    rejected: dict[str, Any] | None
-    period: dict[str, Any] | None
-    compare_period: dict[str, Any] | None
-    cube_query: dict[str, Any] | None
-    # query_cube
-    normalized: list[dict[str, Any]]
-    rows: list[list[dict[str, Any]]]
-    annotation: dict[str, Any] | None
+    llm_models: Annotated[list[str], add]
+    llm_cost: str | None
+    pending: list[ToolCall]  # tool calls the model asked for, to be run by the tools node
+    final: dict[str, Any] | None  # {"kind": ..., "text": ...} once the model called final_answer
+    # tools
+    steps: Annotated[list[dict[str, Any]], add]  # one entry per tool call: name, args, summary
+    queries: Annotated[list[dict[str, Any]], add]  # every run_query: query, ok, rows, columns, error ...
     cube_calls: int
-    # validate_results
-    result: dict[str, Any] | None
+    # verify
+    verify_failures: int
+    verification: dict[str, Any] | None
     # outcome
     outcome: Outcome
     error_kind: ErrorKind | None

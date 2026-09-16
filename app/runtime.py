@@ -12,7 +12,7 @@ from app.agent.graph import graph
 from app.config import settings
 from app.models.state import Deps
 from app.tools.cube import Cube, CubeClient
-from app.tools.llm import OpenRouterPlanLLM
+from app.tools.llm import OpenRouterLLM
 
 lf = get_client()  # one client per process: get_trace_url() caches the project id on the instance
 
@@ -21,8 +21,8 @@ def build_cube() -> Cube:
     return Cube(CubeClient(settings.cube_url, settings.cube_api_secret))
 
 
-def build_llm() -> OpenRouterPlanLLM:
-    return OpenRouterPlanLLM(settings.openrouter_api_key, settings.openrouter_app_title, settings.openrouter_app_url)
+def build_llm() -> OpenRouterLLM:
+    return OpenRouterLLM(settings.openrouter_api_key, settings.openrouter_app_title, settings.openrouter_app_url)
 
 
 def run_question(question: str, deps: Deps) -> dict[str, Any]:
@@ -31,16 +31,16 @@ def run_question(question: str, deps: Deps) -> dict[str, Any]:
     with propagate_attributes(trace_name="marketing-agent", tags=["assessment"], metadata={"as_of": as_of.isoformat()}):
         with lf.start_as_current_observation(as_type="agent", name="marketing-agent", input={"question": question}) as root:
             out = graph.invoke(
-                {"question": question, "as_of": as_of.isoformat(), "cube_calls": 0, "notes": []},
+                {"question": question, "as_of": as_of.isoformat(), "notes": []},
                 context=deps,
                 config={"callbacks": [CallbackHandler()], "run_name": "analytics-graph"},
             )
             root.update(
                 output={"answer": out.get("answer"), "outcome": out.get("outcome")},
                 metadata={
-                    "llm_model": out.get("llm_model"), "llm_cost": out.get("llm_cost"),
+                    "llm_models": out.get("llm_models", []), "llm_cost": out.get("llm_cost"),
                     "llm_calls": out.get("llm_calls", 0), "cube_calls": out.get("cube_calls", 0),
-                    "error_kind": out.get("error_kind"),
+                    "tool_calls": len(out.get("steps", [])), "error_kind": out.get("error_kind"),
                 },
                 level="ERROR" if out.get("outcome") == "error" else "DEFAULT",
             )

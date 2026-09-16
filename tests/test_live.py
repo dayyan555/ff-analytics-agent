@@ -2,7 +2,8 @@
 
 Configuration comes from ``.env`` / the shell (see ``LIVE_ENV`` in conftest);
 the process env itself is pinned to stub values for the offline suite. Budget:
-2 Cube calls for the catalog, then 1 LLM request + 2 Cube calls for one question.
+2 Cube calls for the catalog, a few Cube calls for the tools, then one question
+through the free router (usually 3 model turns, plus any explicit retry).
 """
 
 from __future__ import annotations
@@ -15,8 +16,10 @@ import pytest
 from app.models.state import Deps
 from app.runtime import run_question
 from app.tools.cube import Cube, CubeClient, load_catalog
-from app.tools.llm import OpenRouterPlanLLM
-from tests.conftest import AS_OF, LIVE_ENV
+from app.tools.llm import OpenRouterLLM
+from app.tools.toolkit import Toolkit
+from evals.agent_eval import CASES, check
+from tests.conftest import AS_OF, LIVE_ENV, MP
 
 pytestmark = pytest.mark.skipif(os.environ.get("RUN_LIVE") != "1", reason="set RUN_LIVE=1 to hit Cube and OpenRouter")
 
@@ -35,13 +38,32 @@ def catalog(cube):
 
 
 def test_catalog_shape(catalog):
-    assert set(catalog.measures) >= {"spend", "purchases", "revenue", "roas", "cost_per_purchase"}
-    assert set(catalog.dimensions) == {"channel", "campaign_name", "country", "objective", "device"}
-    assert set(catalog.values) == set(catalog.dimensions)
-    assert all(catalog.values[d] for d in catalog.dimensions)
-    assert catalog.values["country"] == ["DE", "UK", "US"] and catalog.values["device"] == ["desktop", "mobile"]
-    first, last = catalog.coverage
+    view = catalog.views["marketing_performance"]
+    assert set(view.measures) >= {"spend", "purchases", "revenue", "roas", "cost_per_purchase"}
+    assert set(view.dimensions) == {"channel", "campaign_name", "country", "objective", "device"}
+    assert all(view.values[d] for d in view.dimensions)
+    assert view.values["country"] == ["DE", "UK", "US"] and view.values["device"] == ["desktop", "mobile"]
+    first, last = view.coverage
     assert first <= last
+
+
+def test_tools_against_the_real_semantic_layer(cube, catalog):
+    tk = Toolkit(cube, catalog)
+    assert tk.run("describe_view", {"view": "marketing_performance"})["measures"]
+    bad = tk.run("run_query", {"query": {"measures": [MP + "spent"]}})
+    assert bad["ok"] is False and bad["did_you_mean"] == [MP + "spend"]
+    good = tk.run("run_query", {"query": {"measures": [MP + "spend"], "dimensions": [MP + "channel"],
+                                          "timeDimensions": [{"dimension": MP + "date", "dateRange": ["2026-08-01", "2026-08-31"]}]}})
+    assert good["ok"] and good["row_count"] >= 1 and good["periods"] == [{"from": "2026-08-01", "to": "2026-08-31"}]
+    # Exercise the reviewed zero-versus-empty behavior against Cube itself.
+    for channel, period, present in [("email", ["2026-08-01", "2026-08-31"], True),
+                                     ("email", ["2025-01-01", "2025-12-31"], False)]:
+        result = tk.run("run_query", {"query": {
+            "measures": [MP + "spend"],
+            "filters": [{"member": MP + "channel", "operator": "equals", "values": [channel]}],
+            "timeDimensions": [{"dimension": MP + "date", "dateRange": period}],
+        }})
+        assert result["ok"] and result["has_data"] is present
 
 
 def test_cube_cloud_rejects_unsigned_requests():
@@ -52,11 +74,13 @@ def test_cube_cloud_rejects_unsigned_requests():
 
 def test_one_question_through_the_free_router(cube, catalog):
     assert LIVE_ENV.get("OPENROUTER_API_KEY"), "OPENROUTER_API_KEY is required"
-    llm = OpenRouterPlanLLM(LIVE_ENV["OPENROUTER_API_KEY"], LIVE_ENV.get("OPENROUTER_APP_TITLE", "ff-analytics-agent"),
-                            LIVE_ENV.get("OPENROUTER_APP_URL", "https://github.com"))
+    llm = OpenRouterLLM(LIVE_ENV["OPENROUTER_API_KEY"], LIVE_ENV.get("OPENROUTER_APP_TITLE", "ff-analytics-agent"),
+                        LIVE_ENV.get("OPENROUTER_APP_URL", "https://github.com"))
     deps = Deps(llm=llm, cube=cube, catalog=catalog, as_of=AS_OF)
-    out = run_question("How much did we spend by channel in August 2026?", deps)
-    assert out["outcome"] != "error", out.get("error")
-    assert out["llm_model"].endswith(":free")
+    import json
+    case = json.loads(CASES.read_text())[0]  # July total, independently calculated from the seed data
+    out = run_question(case["question"], deps)
+    assert check(out, case["expect"]) == [], check(out, case["expect"])
+    assert all(m.endswith(":free") for m in out["llm_models"])
     assert out["llm_cost"] == "0"
-    assert out["cube_calls"] == 2
+    assert any(q["ok"] for q in out["queries"])

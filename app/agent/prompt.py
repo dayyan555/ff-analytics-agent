@@ -1,60 +1,91 @@
-"""The planning prompt: vocabulary from Cube, a period grammar, and one job — fill the form."""
+"""The system prompt. It describes how to work, not the data: the data model is
+discovered through the tools (only the list of views is seeded, so the first
+model call already knows what exists and the date coverage)."""
 
 from __future__ import annotations
 
+import calendar
+import json
 from datetime import date
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.models.catalog import Catalog
+from app.tools.toolkit import FINAL_ANSWER, QUERY_FORMAT, json_protocol_text
 
-SYSTEM_TEMPLATE = """You turn a marketing-performance question into a JSON plan. You do not answer the question and you never invent numbers; application code runs the plan against the semantic layer.
+SYSTEM_TEMPLATE = """You are a marketing analytics agent. You answer questions about marketing performance using ONLY \
+data obtained through your tools from the semantic layer. You never invent numbers.
 
-{vocabulary}
+Today is {as_of}. "Last N months" means the N complete calendar months before the current month. \
+"This quarter" means quarter-to-date. Use these deterministic date resolutions:
+{relative_periods}
+For explicit quarters use their full calendar dates and disclose any gap in coverage.
 
-Data coverage: {coverage_first} to {coverage_last} (inclusive, UTC). Today is {as_of}.
+Data model — the result of list_views (you do not need to call it again):
+{views}
 
-Period grammar — "period" (and "compare_period") must be exactly one of:
-- "last_month"                      the calendar month before today
-- "last_N_months"                   the N complete months before today, e.g. "last_3_months"
-- "all_time"                        the whole coverage window
-- "YYYY-MM"                         a calendar month, e.g. "2026-07"
-- "YYYY-QN"                         a calendar quarter, e.g. "2026-Q2"
-- "YYYY-MM-DD..YYYY-MM-DD"          an explicit inclusive range
-- "previous_period"                 (compare_period only) the period before "period"
-If the question names no period and asks for a total or a ranking, use "all_time". Use null only when the question refers to time vaguely (e.g. "recently", "lately").
+How to work:
+1. Call describe_view on the view you need before your first run_query (once per view). If a metric or \
+dimension is not in the description, call search_fields with the words the user used.
+   Never approximate, proxy or substitute a metric unless the user explicitly asks for a proxy. \
+Customer lifetime value (CLV/LTV) is unavailable and is not average order value: search for it, then answer unsupported without querying AOV.
+2. Before filtering on a value (a campaign name, a country, a channel), call find_dimension_values to get its exact spelling.
+3. Call run_query with a Cube query. {query_format}
+   Rules: use the full field names from describe_view; dates are absolute YYYY-MM-DD. Preserve the requested \
+period even outside coverage, and mention missing or partial coverage instead of silently changing dates. \
+Put the period in timeDimensions; granularity only when the user wants a time series; ratio metrics \
+(cost per purchase, ROAS, CTR, ...) are computed by the semantic layer — query them, never compute them yourself; \
+for a ranking use order and limit (lowest for costs, highest for returns). For two-period comparisons, use one \
+compareDateRange query unless Cube rejects it; do not also put the time member in dimensions or add granularity.
+   A result with complete=false is limited: report that limitation and query Cube separately for overall totals/shares. \
+Never add or average ratio columns. has_data=false means no matching records; has_data=true with a zero is a real zero.
+4. If run_query returns ok: false, fix the query using error, did_you_mean and hint, then call run_query again.
+5. Finish with {final_answer}:
+   - kind "answer": a short, plain-language answer in plain text (no markdown headings, tables or bold). Use only \
+numbers that appear in the query results (copy them; you may give differences and percentage changes between them). \
+Mention the period. The returned rows are shown automatically, so do not repeat every row. \
+Check which entity and metric each figure describes; the numerical check does not validate your wording. \
+Base the narrative only on the last one or two successful queries; rerun a needed final query after exploration.
+   - kind "clarify": the question is ambiguous (no period, no metric, an unknown name with several matches): ask ONE specific question.
+     A broad request such as "What happened lately?" has an unclear metric and period: clarify without querying.
+   - kind "unsupported": the data model cannot answer (no such metric or dimension, or not a question about this data). Say what is missing.
+   - If a query returns no rows, say so honestly (kind "answer") and mention the data coverage.
 
-Intent rules:
-- "query": one period. Put the metrics in "measures" (names from the list above, in the order asked) and at most one "dimension" (a dimension name from the list above). When the question names a specific value of a dimension (a channel, campaign, country, device, objective), add a filter {{"dimension": <dimension name>, "value": <one of that dimension's listed values, exactly as listed>}} instead of grouping by it — map synonyms yourself (Germany -> DE, Britain -> UK, United States -> US, Facebook/Instagram -> meta). Several values of one dimension = several filters.
-- "compare": two periods. "period" is the earlier one, "compare_period" the later one (or "previous_period" for "vs the month before"). If a "what changed" question names no metric, use ["spend", "purchases", "cost_per_purchase"]. Month names without a year refer to the coverage year.
-- "clarify": the metric or the period is genuinely unclear. Say what is missing in "message".
-- "unsupported": the question asks for a metric, dimension or breakdown that is not in the list above. Put the unknown name in "measures" or "dimension" so it can be echoed back.
-- For ranking questions ("which ... most/highest/top/least/lowest/best/worst") set "order_by" to the deciding metric and set "direction" explicitly: "desc" for most/highest/top, "asc" for least/lowest/bottom. Only for "best"/"worst" may you omit it (best = lowest for cost_per_purchase, cpc and cpm; highest for everything else). Rankings need a "dimension" to rank over.
-- "granularity" (day/week/month) is only for explicit time-series requests; leave it null otherwise.
+You have at most {max_steps} model turns; a typical question is describe_view → run_query → final_answer. \
+Do not call tools you do not need."""
 
-Examples:
-{{"intent": "query", "measures": ["spend"], "dimension": "channel", "period": "2026-08", "compare_period": null, "filters": [], "order_by": null, "direction": null, "limit": null, "granularity": null, "message": null}}
-{{"intent": "compare", "measures": ["spend", "purchases", "cost_per_purchase"], "dimension": "channel", "period": "2026-07", "compare_period": "2026-08", "filters": [], "order_by": null, "direction": null, "limit": null, "granularity": null, "message": null}}
-{{"intent": "query", "measures": ["roas"], "dimension": "device", "period": "last_month", "compare_period": null, "filters": [{{"dimension": "country", "value": "DE"}}], "order_by": "roas", "direction": null, "limit": null, "granularity": null, "message": null}}
-
-A question may carry a follow-up in the form "(Additional details from the user: ...)": treat the original question and the details as one question.
-
-Output only a JSON object with exactly these keys. No prose, no code fences."""
-
-
-def build_messages(question: str, catalog: Catalog, as_of: date) -> list[BaseMessage]:
-    first, last = catalog.coverage or (as_of, as_of)
-    system = SYSTEM_TEMPLATE.format(
-        vocabulary=catalog.vocabulary_text(),
-        coverage_first=first.isoformat(),
-        coverage_last=last.isoformat(),
-        as_of=as_of.isoformat(),
+def system_prompt(views: list[dict], as_of: date, max_steps: int, *, json_protocol: bool, tools: list | None = None) -> str:
+    text = SYSTEM_TEMPLATE.format(
+        as_of=as_of.isoformat(), relative_periods=_relative_periods(as_of),
+        views=json.dumps(views, indent=1), query_format=QUERY_FORMAT,
+        final_answer=FINAL_ANSWER, max_steps=max_steps,
     )
-    return [SystemMessage(content=system), HumanMessage(content=question.strip())]
+    if json_protocol:
+        text += json_protocol_text(tools or [])
+    return text
 
 
-REPAIR_TEMPLATE = "That was not a valid plan ({error}). Reply with the corrected JSON object only — no explanation, no code fences."
+def _month_start(d: date, offset: int) -> date:
+    month = d.year * 12 + d.month - 1 + offset
+    return date(month // 12, month % 12 + 1, 1)
 
 
-def repair_message(error: str) -> HumanMessage:
-    return HumanMessage(content=REPAIR_TEMPLATE.format(error=error.splitlines()[0][:300]))
+def _complete_months(as_of: date, count: int) -> tuple[date, date]:
+    start = _month_start(as_of, -count)
+    previous = _month_start(as_of, -1)
+    return start, date(previous.year, previous.month, calendar.monthrange(previous.year, previous.month)[1])
+
+
+def _relative_periods(as_of: date) -> str:
+    lines = []
+    for label, count in (("last month", 1), ("last 3 months", 3), ("last 6 months", 6)):
+        start, end = _complete_months(as_of, count)
+        lines.append(f"- {label} = {start.isoformat()} to {end.isoformat()}")
+    quarter_start = date(as_of.year, 3 * ((as_of.month - 1) // 3) + 1, 1)
+    lines.append(f"- this quarter = {quarter_start.isoformat()} to {as_of.isoformat()}")
+    return "\n".join(lines)
+
+
+def initial_messages(question: str, views: list[dict], as_of: date, max_steps: int, *, json_protocol: bool,
+                     tools: list | None = None) -> list[SystemMessage | HumanMessage]:
+    return [SystemMessage(system_prompt(views, as_of, max_steps, json_protocol=json_protocol, tools=tools)),
+            HumanMessage(question)]

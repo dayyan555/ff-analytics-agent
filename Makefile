@@ -1,4 +1,4 @@
-.PHONY: sync seed serve examples eval test graph cube-check check-secrets
+.PHONY: sync seed serve examples eval smoke test graph cube-check check-secrets
 
 sync:
 	uv sync --extra seed
@@ -12,9 +12,12 @@ serve:
 examples:
 	uv run python examples.py
 
-# Plan accuracy of the real model on evals/plan_cases.json (one request per case; no Cube queries).
+# Behaviour of the real model on evals/cases.json: outcome + the fields of the query it wrote (~3 requests per case).
 eval:
-	uv run python evals/plan_accuracy.py
+	uv run python evals/agent_eval.py
+
+smoke:
+	uv run python evals/agent_eval.py --smoke
 
 test:
 	uv run pytest -q
@@ -24,7 +27,7 @@ graph:
 
 # Pre-warm Cube Cloud (readyz + signed /meta) before recording or running examples.
 cube-check:
-	uv run python -c "from app.config import settings; from app.models.catalog import VIEW; from app.tools.cube import CubeClient; import httpx; c = CubeClient(settings.cube_url, settings.cube_api_secret); print('readyz:', httpx.get(settings.cube_url + '/readyz', timeout=30).status_code); names = [x['name'] for x in c.meta()['cubes']]; print('meta: 200 · view', VIEW, 'found' if VIEW in names else 'MISSING', names)"
+	uv run python -c "from app.config import settings; from app.tools.cube import CubeClient; import httpx; c = CubeClient(settings.cube_url, settings.cube_api_secret); print('readyz:', httpx.get(settings.cube_url + '/readyz', timeout=30).status_code); views = [x['name'] for x in c.meta()['cubes'] if x.get('type') == 'view']; print('meta: 200 · views:', views or 'NONE')"
 
 # Fails (exit 1) if anything that looks like a key or a cloud hostname is in the tree.
 check-secrets:

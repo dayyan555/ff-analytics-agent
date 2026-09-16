@@ -24,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from app.agent.nodes import MAX_MODEL_CALLS
 from app.models.state import Deps
 from app.runtime import build_cube, build_llm, lf, run_question, trace_url_for
 from app.tools.cube import load_catalog
@@ -35,12 +36,11 @@ STATIC_INDEX = Path(__file__).parent / "static" / "index.html"
 
 PAYLOAD_KEYS = (
     "question", "as_of", "outcome", "error_kind", "error", "error_stage", "answer", "answer_body", "footer",
-    "plan", "plan_raw", "rejected", "period", "compare_period", "filters", "cube_query", "normalized", "rows",
-    "annotation", "result", "notes", "llm_model", "llm_cost", "llm_calls", "cube_calls", "trace_id", "trace_url",
-    "timing_ms",
+    "final", "steps", "queries", "verification", "notes", "llm_models", "llm_cost", "llm_calls", "cube_calls",
+    "trace_id", "trace_url", "timing_ms",
 )
-ERROR_STATUS = {"cube": 503, "llm": 502, "free_guard": 502, "validation": 502, "internal": 500, "busy": 409,
-                "bad_request": 400}
+ERROR_STATUS = {"cube": 503, "llm": 502, "free_guard": 502, "validation": 502, "budget": 502, "internal": 500,
+                "busy": 409, "bad_request": 400}
 
 
 class AskRequest(BaseModel):
@@ -64,13 +64,9 @@ def to_payload(question: str, as_of: date, out: dict[str, Any], timing_ms: int) 
         "error_kind": out.get("error_kind"), "error": out.get("error"),
         "error_stage": "graph" if outcome == "error" else None,
         "answer": out.get("answer"), "answer_body": out.get("answer_body"), "footer": out.get("footer"),
-        "plan": out.get("plan"), "plan_raw": out.get("plan_raw"), "rejected": out.get("rejected"),
-        "period": out.get("period"), "compare_period": out.get("compare_period"),
-        "filters": (out.get("cube_query") or {}).get("filters") or [],
-        "cube_query": out.get("cube_query"), "normalized": out.get("normalized") or [],
-        "rows": out.get("rows") or [], "annotation": out.get("annotation"), "result": out.get("result"),
-        "notes": out.get("notes") or [],
-        "llm_model": out.get("llm_model"), "llm_cost": out.get("llm_cost"),
+        "final": out.get("final"), "steps": out.get("steps") or [], "queries": out.get("queries") or [],
+        "verification": out.get("verification"), "notes": out.get("notes") or [],
+        "llm_models": out.get("llm_models") or [], "llm_cost": out.get("llm_cost"),
         "llm_calls": out.get("llm_calls", 0), "cube_calls": out.get("cube_calls", 0),
         "trace_id": trace_id, "trace_url": trace_url_for(trace_id), "timing_ms": timing_ms,
     }
@@ -82,7 +78,7 @@ def error_payload(question: str, as_of: date, kind: str, message: str, stage: st
     payload.update(
         question=question, as_of=as_of.isoformat(), outcome="error", error_kind=kind, error=message,
         error_stage=stage, answer=message, answer_body=message, footer="",
-        filters=[], normalized=[], rows=[], notes=[], llm_calls=0, cube_calls=0, timing_ms=0,
+        steps=[], queries=[], notes=[], llm_models=[], llm_calls=0, cube_calls=0, timing_ms=0,
     )
     return payload
 
@@ -186,6 +182,7 @@ def create_app(*, cube: Any = None, llm: Any = None, loader: Any = load_catalog)
             "cube": "ok" if cube_ok else "down",
             "cube_url_kind": "cloud" if "cubecloudapp.dev" in state.cube.base_url else "local",
             "catalog": {"loaded": True, **state.catalog.summary()} if state.catalog else {"loaded": False},
+            "max_model_calls": MAX_MODEL_CALLS,
             "catalog_error": state.catalog_error,
             "langfuse": "enabled" if config.settings.langfuse_enabled else "disabled",
             "model": MODEL_ID,

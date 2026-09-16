@@ -7,7 +7,7 @@ from typing import NamedTuple
 
 class Example(NamedTuple):
     question: str
-    kind: str  # normal | compare | unsupported | ambiguous | empty
+    kind: str  # normal | series | compare | unsupported | ambiguous | empty
     expect: str  # the expected outcome: answer | unsupported | clarify | no_data
 
 
@@ -17,6 +17,7 @@ EXAMPLE_QUESTIONS: list[Example] = [
     Example("Which campaign had the strongest result relative to spend last month?", "normal", "answer"),
     Example("Which device had the better ROAS in Germany over the last 3 months?", "normal", "answer"),
     Example("What was the average order value by objective in Q2 2026?", "normal", "answer"),
+    Example("How did spend trend week by week in August 2026?", "series", "answer"),
     Example("What changed between July and August by channel?", "compare", "answer"),
     Example("Which campaign had the best profit margin?", "unsupported", "unsupported"),
     Example("How did we do recently?", "ambiguous", "clarify"),

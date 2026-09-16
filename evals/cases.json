@@ -1,0 +1,264 @@
+[
+  {
+    "question": "Total spend in July 2026",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "spend"
+      ],
+      "period": [
+        "2026-07-01",
+        "2026-07-31"
+      ],
+      "rows": [
+        {
+          "spend": "46874.27"
+        }
+      ]
+    }
+  },
+  {
+    "question": "Purchases by device last month",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "purchases"
+      ],
+      "dimensions": [
+        "device"
+      ],
+      "period": [
+        "2026-08-01",
+        "2026-08-31"
+      ],
+      "rows": [
+        {
+          "device": "desktop",
+          "purchases": 512
+        },
+        {
+          "device": "mobile",
+          "purchases": 832
+        }
+      ]
+    }
+  },
+  {
+    "question": "Which channel had the lowest cost per purchase in Q2 2026?",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "cost_per_purchase"
+      ],
+      "dimensions": [
+        "channel"
+      ],
+      "period": [
+        "2026-04-01",
+        "2026-06-30"
+      ],
+      "order": [
+        "cost_per_purchase",
+        "asc"
+      ]
+    }
+  },
+  {
+    "question": "Revenue by country over the last 6 months",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "revenue"
+      ],
+      "dimensions": [
+        "country"
+      ],
+      "period": [
+        "2026-03-01",
+        "2026-08-31"
+      ]
+    }
+  },
+  {
+    "question": "What was the click-through rate for TikTok in August 2026?",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "ctr"
+      ],
+      "filters": {
+        "channel": "tiktok"
+      },
+      "period": [
+        "2026-08-01",
+        "2026-08-31"
+      ],
+      "rows": [
+        {
+          "ctr": "0.01500643601242068449923284749"
+        }
+      ]
+    }
+  },
+  {
+    "question": "Compare spend and purchases in Q2 vs Q3 2026 by channel",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "spend",
+        "purchases"
+      ],
+      "dimensions": [
+        "channel"
+      ],
+      "periods": [
+        [
+          "2026-04-01",
+          "2026-06-30"
+        ],
+        [
+          "2026-07-01",
+          "2026-08-31"
+        ]
+      ],
+      "answer_contains": [
+        "partial"
+      ]
+    }
+  },
+  {
+    "question": "How did ROAS change from July to August for Brand Search US?",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "roas"
+      ],
+      "filters": {
+        "campaign_name": "Brand Search US"
+      },
+      "allowed_filters": {
+        "country": "US"
+      },
+      "periods": [
+        [
+          "2026-07-01",
+          "2026-07-31"
+        ],
+        [
+          "2026-08-01",
+          "2026-08-31"
+        ]
+      ]
+    }
+  },
+  {
+    "question": "Which objective had the highest conversion rate in May 2026?",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "conversion_rate"
+      ],
+      "dimensions": [
+        "objective"
+      ],
+      "period": [
+        "2026-05-01",
+        "2026-05-31"
+      ],
+      "order": [
+        "conversion_rate",
+        "desc"
+      ]
+    }
+  },
+  {
+    "question": "Show me the customer lifetime value by channel",
+    "expect": {
+      "outcome": "unsupported"
+    }
+  },
+  {
+    "question": "Spend by city last month",
+    "expect": {
+      "outcome": [
+        "unsupported",
+        "clarify"
+      ]
+    }
+  },
+  {
+    "question": "What happened lately?",
+    "expect": {
+      "outcome": "clarify"
+    }
+  },
+  {
+    "question": "Purchases for Winback Series in 2025",
+    "expect": {
+      "outcome": "no_data",
+      "measures": [
+        "purchases"
+      ],
+      "filters": {
+        "campaign_name": "Winback Series"
+      },
+      "period": [
+        "2025-01-01",
+        "2025-12-31"
+      ],
+      "no_data": true
+    }
+  },
+  {
+    "question": "CPM by channel for desktop in June 2026",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "cpm"
+      ],
+      "dimensions": [
+        "channel"
+      ],
+      "filters": {
+        "device": "desktop"
+      },
+      "period": [
+        "2026-06-01",
+        "2026-06-30"
+      ]
+    }
+  },
+  {
+    "question": "Average order value for retention campaigns over the last 3 months",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "aov"
+      ],
+      "filters": {
+        "objective": "retention"
+      },
+      "period": [
+        "2026-06-01",
+        "2026-08-31"
+      ]
+    }
+  },
+  {
+    "question": "Daily clicks for Shopping DE in the first week of August 2026",
+    "expect": {
+      "outcome": "answer",
+      "measures": [
+        "clicks"
+      ],
+      "filters": {
+        "campaign_name": "Shopping DE"
+      },
+      "granularity": "day",
+      "period": [
+        "2026-08-01",
+        "2026-08-07"
+      ]
+    }
+  }
+]

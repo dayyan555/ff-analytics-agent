@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from app.models.catalog import INTERNAL, RATIOS
+from app.models.catalog import INTERNAL
 from tests.conftest import DIMENSIONS, MEASURES
 
 MODEL = Path(__file__).resolve().parents[1] / "cube" / "model"
@@ -31,6 +31,7 @@ def test_conftest_dimensions_and_ratios_mirror_the_cube_model():
     assert (campaigns | daily) - {"date"} == {d[0] for d in DIMENSIONS}
     view = _yaml("views/marketing_performance.yml")["views"][0]
     included = {name for c in view["cubes"] for name in c["includes"]}
-    assert set(RATIOS) <= included and INTERNAL <= included
+    ratios = {m[0] for m in MEASURES if m[1] == "number"}
+    assert ratios <= included and INTERNAL <= included
     ratio_types = {m["name"]: m["type"] for m in _yaml("cubes/campaign_daily.yml")["cubes"][0]["measures"]}
-    assert all(ratio_types[r] == "number" for r in RATIOS)
+    assert all(ratio_types[r] == "number" for r in ratios)

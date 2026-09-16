@@ -39,7 +39,7 @@
   .tab.active{display:block}
   pre{margin:0;font-family:var(--mono);font-size:12px;white-space:pre}
   table{border-collapse:collapse;font-family:var(--mono);font-size:12px;white-space:nowrap}
-  th,td{border-bottom:1px solid var(--line);padding:4px 10px;text-align:right} th:first-child,td:first-child{text-align:left}
+  th,td{border-bottom:1px solid var(--line);padding:4px 10px;text-align:right;vertical-align:top} th:first-child,td:first-child,td.left{text-align:left;white-space:normal}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
   .chip{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:6px 12px;font-size:13px;cursor:pointer;color:var(--ink)}
   .chip:hover{border-color:var(--accent);color:var(--accent)}
@@ -67,7 +67,7 @@
 
 <div class="composer">
   <div class="row">
-    <textarea id="question" rows="1" placeholder="Ask about spend, purchases, ROAS… by channel or campaign"></textarea>
+    <textarea id="question" rows="1" placeholder="Ask about spend, purchases, ROAS… by channel, campaign, country, device, over time"></textarea>
     <button class="send" id="send">Send</button>
   </div>
   <div class="hint">Enter to send · Shift+Enter for a new line · one question at a time (free-model quota)</div>
@@ -88,34 +88,35 @@ function bubble(kind, html) {
 }
 
 // ---- header status -------------------------------------------------------
-async function loadHealth() {
+async function loadHealth() {  // one refresh; pollHealth() schedules the next
   try {
     health = await (await fetch('/health')).json();
     const cube = health.cube === 'ok';
-    const cat = health.catalog && health.catalog.loaded
-      ? `catalog: ${health.catalog.measures.length} metrics / ${health.catalog.dimensions.length} dimensions · data ${health.catalog.coverage.first} → ${health.catalog.coverage.last}`
+    const v = health.catalog && health.catalog.loaded ? health.catalog.views : null;
+    const dated = v ? v.find(x => x.data_from && x.data_to) : null;
+    const cat = v && v.length
+      ? `${v.length} view${v.length > 1 ? 's' : ''} · ${v.reduce((n, x) => n + x.measures, 0)} metrics / ${v.reduce((n, x) => n + x.dimensions, 0)} dimensions` + (dated ? ` · data ${esc(dated.data_from)} → ${esc(dated.data_to)}` : '')
       : 'catalog: not loaded';
     $('status').innerHTML = `<span class="dot ${cube ? 'ok' : 'bad'}"></span>Cube ${cube ? 'ok' : 'down'} (${esc(health.cube_url_kind)}) · ${esc(cat)} · tracing ${health.langfuse === 'enabled' ? 'on' : 'off'} · ${esc(health.model)}`;
-    if (!cube || !(health.catalog && health.catalog.loaded)) {
+    if (!cube || !v) {
       const note = $('degraded') || Object.assign(document.createElement('div'), {id: 'degraded'});
       note.className = 'msg agent'; note.innerHTML = `<div class="avatar">FF</div><div class="bubble"><span class="badge error">semantic layer</span><div>${esc(health.catalog_error || 'Cube is not reachable right now.')}</div></div>`;
       if (!$('degraded')) thread.appendChild(note);
     } else if ($('degraded')) $('degraded').remove();
   } catch (e) { $('status').innerHTML = '<span class="dot bad"></span>server unreachable'; }
-  setTimeout(loadHealth, 10000);
 }
+function pollHealth() { loadHealth().finally(() => setTimeout(pollHealth, 10000)); }
 
 // ---- empty state -----------------------------------------------------------
 async function greet() {
   let examples = [], h = null;
   try { examples = (await (await fetch('/examples')).json()).examples; } catch (e) {}
   try { h = await (await fetch('/health')).json(); } catch (e) {}
-  const cat = h && h.catalog && h.catalog.loaded ? h.catalog : null;
-  const dims = cat ? cat.dimensions.map(d => d.replace('_', ' ')).join(', ') : 'channel, campaign, country, device or objective';
-  const span = cat ? ` The data covers ${esc(cat.coverage.first)} to ${esc(cat.coverage.last)}.` : '';
+  const view = h && h.catalog && h.catalog.loaded ? h.catalog.views.find(x => x.data_from && x.data_to) : null;
+  const span = view ? ` The data covers ${esc(view.data_from)} to ${esc(view.data_to)}.` : '';
   const chips = examples.map(e => `<button class="chip" data-q="${esc(e.question)}" title="${esc(e.kind)}">${esc(e.question)}</button>`).join('');
-  bubble('agent', `<div>Hi. I answer questions about marketing performance — spend, purchases, revenue, ROAS, cost per purchase and more — by ${esc(dims)}.${span} Every number comes from the semantic layer; if I can't answer, I'll say why.</div><div class="chips">${chips}</div>`);
-  thread.addEventListener('click', ev => { const c = ev.target.closest('.chip'); if (c) { input.value = c.dataset.q; autosize(); input.focus(); } });
+  bubble('agent', `<div>Hi. I answer questions about marketing performance — spend, purchases, revenue, ROAS, cost per purchase and more — by channel, campaign, country, device or objective, within the available data coverage.${span} I use Cube to retrieve the data and show the returned rows alongside my answer. A numerical consistency check catches some unsupported figures, but it does not verify the meaning of every sentence. If I can't answer, I'll say why.</div><div class="chips">${chips}</div>`);
+  thread.addEventListener('click', ev => { const c = ev.target.closest('.chip'); if (c) { pendingClarification = null; input.value = c.dataset.q; autosize(); input.focus(); } });
 }
 
 // ---- asking ----------------------------------------------------------------
@@ -135,7 +136,8 @@ async function ask() {
     status = r.status; resp = await r.json();
   } catch (e) { resp = {outcome: 'error', error_kind: 'network', error: String(e), answer_body: 'The server did not respond: ' + String(e), llm_calls: 0, cube_calls: 0, timing_ms: Math.round(performance.now() - t0)}; }
   typing.querySelector('.bubble').innerHTML = renderAgent(resp, status);
-  pendingClarification = resp.outcome === 'clarify' ? {question} : null;
+  const transient = resp.outcome === 'error' && ['busy', 'bad_request', 'network'].includes(resp.error_kind);
+  if (!transient) pendingClarification = resp.outcome === 'clarify' ? {question} : null;  // a follow-up that never ran keeps its context
   busy = false; sendBtn.disabled = false; input.focus(); scrollDown(); loadHealth();
 }
 
@@ -144,35 +146,42 @@ function renderAgent(resp, status) {
   const badge = outcome === 'error' ? `error · ${esc(resp.error_kind || 'unknown')}` : outcome.replace('_', ' ');
   const body = resp.answer_body || resp.answer || resp.error || '';
   const stage = resp.error_stage === 'catalog' ? '<div class="meta">graph not invoked — no model call was made</div>' : '';
-  const meta = `${(resp.timing_ms / 1000).toFixed(1)} s · model calls ${resp.llm_calls ?? 0} · cube calls ${resp.cube_calls ?? 0}` + (resp.llm_model ? ` · ${esc(resp.llm_model)}` : '') + (status ? ` · HTTP ${status}` : '');
+  const models = (resp.llm_models || []).join(', ');
+  const meta = `${(resp.timing_ms / 1000).toFixed(1)} s · model calls ${resp.llm_calls ?? 0} · tool calls ${(resp.steps || []).length} · cube calls ${resp.cube_calls ?? 0}` + (models ? ` · ${esc(models)}` : '') + (status ? ` · HTTP ${status}` : '');
   const id = 'd' + Math.random().toString(36).slice(2);
-  const hood = resp.plan || resp.cube_query || resp.trace_id ? `
+  const hood = (resp.steps && resp.steps.length) || resp.trace_id ? `
     <details>
       <summary>Under the hood</summary>
       <div class="tabs" data-for="${id}">
-        <button class="active" data-tab="plan">Plan</button><button data-tab="query">Cube query</button>
-        <button data-tab="rows">Rows</button><button data-tab="result">Result</button><button data-tab="trace">Trace</button>
+        <button class="active" data-tab="steps">Steps</button><button data-tab="queries">Queries</button>
+        <button data-tab="rows">Rows</button><button data-tab="check">Check</button><button data-tab="trace">Trace</button>
       </div>
-      <div class="tab active" id="${id}-plan"><pre>${esc(pretty(resp.plan))}</pre></div>
-      <div class="tab" id="${id}-query"><pre>${esc(pretty(resp.cube_query))}</pre></div>
-      <div class="tab" id="${id}-rows">${renderRows(resp.rows || [], resp.annotation)}</div>
-      <div class="tab" id="${id}-result"><pre>${esc(pretty(resp.result))}</pre></div>
+      <div class="tab active" id="${id}-steps">${renderSteps(resp.steps || [], resp.final)}</div>
+      <div class="tab" id="${id}-queries"><pre>${esc(pretty((resp.queries || []).map(q => ({query_id: q.query_id, ok: q.ok, query: q.query, error: q.error, did_you_mean: q.did_you_mean}))))}</pre></div>
+      <div class="tab" id="${id}-rows">${renderRows(resp.queries || [])}</div>
+      <div class="tab" id="${id}-check"><pre>${esc(pretty({verification: resp.verification, notes: resp.notes}))}</pre></div>
       <div class="tab" id="${id}-trace">${traceHtml(resp)}</div>
     </details>` : '';
   return `<span class="badge ${esc(outcome)}">${badge}</span><div class="body">${esc(body)}</div>${stage}` +
          (resp.footer ? `<div class="footer">${esc(resp.footer)}</div>` : '') + `<div class="meta">${meta}</div>${hood}`;
 }
 
-function renderRows(rowSets, annotation) {
-  if (!rowSets.length || rowSets.every(r => !r.length)) return '<div class="meta">no rows</div>';
-  const ann = Object.assign({}, (annotation || {}).dimensions || {}, (annotation || {}).measures || {});
-  const title = k => (ann[k] && ann[k].shortTitle) || k.replace('marketing_performance.', '');
-  return rowSets.map((rows, i) => {
-    if (!rows.length) return `<div class="meta">result set ${i + 1}: no rows</div>`;
-    const keys = Object.keys(rows[0]).filter(k => k !== 'compareDateRange');
-    const head = keys.map(k => `<th>${esc(title(k))}</th>`).join('');
-    const body = rows.map(r => '<tr>' + keys.map(k => `<td>${r[k] == null ? '—' : esc(r[k])}</td>`).join('') + '</tr>').join('');
-    return (rowSets.length > 1 ? `<div class="meta">result set ${i + 1} (${esc(rows[0].compareDateRange || '')})</div>` : '') + `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+function renderSteps(steps, final) {
+  if (!steps.length && !final) return '<div class="meta">no tool calls</div>';
+  const rows = steps.map(st => `<tr><td>${st.step}</td><td>${esc(st.tool)}</td><td class="left">${esc(JSON.stringify(st.args))}</td><td class="left">${st.ok ? '' : '⚠ '}${esc(st.summary)}</td></tr>`).join('');
+  const fin = final ? `<tr><td>${steps.length + 1}</td><td>final_answer</td><td class="left">${esc(final.kind)}</td><td class="left">${esc((final.text || '').slice(0, 160))}</td></tr>` : '';
+  return `<table><thead><tr><th>#</th><th>tool</th><th>arguments</th><th>result</th></tr></thead><tbody>${rows}${fin}</tbody></table>`;
+}
+
+function renderRows(queries) {
+  const ok = queries.filter(q => q.ok);
+  if (!ok.length) return '<div class="meta">no query returned rows</div>';
+  return ok.map(q => {
+    if (!q.rows || !q.rows.length) return `<div class="meta">${esc(q.query_id)}: no rows</div>`;
+    const cols = q.columns || Object.keys(q.rows[0]).map(k => ({key: k, title: k}));
+    const head = cols.map(c => `<th>${esc(c.title)}</th>`).join('');
+    const body = q.rows.map(r => '<tr>' + cols.map(c => `<td>${r[c.key] == null ? '—' : esc(r[c.key])}</td>`).join('') + '</tr>').join('');
+    return `<div class="meta">${esc(q.query_id)} · ${q.row_count} row(s)${q.complete === false ? " · limited results" : ""}</div>${q.note ? `<div class="meta">${esc(q.note)}</div>` : ""}<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
   }).join('');
 }
 
@@ -192,10 +201,10 @@ thread.addEventListener('click', ev => {
 // ---- composer ----------------------------------------------------------------
 function autosize() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; }
 input.addEventListener('input', autosize);
-input.addEventListener('keydown', ev => { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); ask(); } });
+input.addEventListener('keydown', ev => { if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) { ev.preventDefault(); ask(); } });
 sendBtn.addEventListener('click', ask);
 
-greet(); loadHealth(); input.focus();
+greet(); pollHealth(); input.focus();
 </script>
 </body>
 </html>
